@@ -1,0 +1,436 @@
+//! Fixed-topology Shared-Nothing multi-Shard `std.Io` runtime.
+//!
+//! Lifecycle contract (AGENTS.md §2, §3, §4):
+//! - Fixed homogeneous `shard_count` resolved at `init`; never mutated at runtime.
+//! - Two-phase startup:
+//!   1. `init`: allocates Shards, `epoll`/`IOCP` instances, `ShardMesh`, `FutexTable`,
+//!      `BlockingPool`, and (on Windows) `Acceptor`, with exact `errdefer` rollback.
+//!   2. `start` / `run`: spawns OS threads, barrier-synchronizes readiness across
+//!      all Shards, and runs the user entry function on each Shard's own `std.Io`.
+//! - Ordered teardown: `requestStop` -> Shard tasks finish -> `join` (panics on
+//!   self-join deadlock) -> `Acceptor` & `BlockingPool` & `ShardMesh` cleanup.
+
+const builtin = @import("builtin");
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+
+const Shard = @import("Shard.zig");
+const BlockingPool = @import("BlockingPool.zig");
+const FutexTable = @import("FutexTable.zig");
+const ShardMesh = @import("ShardMesh.zig");
+const SpscRingMod = @import("SpscRing.zig");
+const AcceptorMod = @import("Acceptor.zig");
+const Acceptor = AcceptorMod.Acceptor;
+
+const Runtime = @This();
+
+pub const InitOptions = struct {
+    /// Number of homogeneous Shards (`null` defaults to logical CPU count >= 1).
+    shard_count: ?usize = null,
+    /// Per-ordered-pair SPSC ring capacity in `ShardMesh` (power of two >= 2).
+    mesh_ring_capacity: usize = ShardMesh.default_ring_capacity,
+    /// Per-Shard Windows Acceptor handoff inbox capacity.
+    acceptor_inbox_capacity: u32 = 256,
+    /// Per-Fiber stack size in bytes.
+    stack_size: usize = 512 * 1024,
+    /// Maximum idle Fiber stacks retained per Shard before watermark eviction.
+    max_cached_stacks: usize = 64,
+    /// Maximum file descriptor table bound per Shard on Linux.
+    max_fds: u32 = if (builtin.os.tag == .linux) 65536 else 0,
+    /// Worker thread stack size for each Shard's OS thread.
+    thread_stack_size: usize = 1024 * 1024,
+    /// Shared `BlockingPool` thread count (`null` defaults to `clamp((cpus+1)/2, 2, 8)`).
+    blocking_threads: ?usize = null,
+    /// Shared `BlockingPool` bounded queue capacity.
+    blocking_queue_capacity: ?usize = null,
+    /// Optional process environment block for child process spawning.
+    environ: std.process.Environ = .empty,
+};
+
+pub const InitError = Shard.InitError || SpscRingMod.InitError || error{InvalidCapacity};
+
+const State = enum(u8) {
+    initialized,
+    running,
+    joined,
+};
+
+inline fn kernelIo() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
+
+gpa: Allocator,
+shards: []Shard,
+threads: []std.Thread,
+spawned_threads: usize = 0,
+thread_stack_size: usize,
+
+blocking_pool: BlockingPool = undefined,
+futex_table: FutexTable = .init,
+mesh: ShardMesh = undefined,
+acceptor: Acceptor = undefined,
+has_acceptor: bool = false,
+stderr_mutex: Io.Mutex = .init,
+
+state: State = .initialized,
+stopping: std.atomic.Value(bool) = .init(false),
+
+barrier_mutex: Io.Mutex = .init,
+barrier_cond: Io.Condition = .init,
+barrier_ready_count: usize = 0,
+barrier_failed: bool = false,
+
+active_runner_ctx: ?*anyopaque = null,
+cleanup_runner_fn: ?*const fn (Allocator, *anyopaque) void = null,
+
+/// Phase 1: Allocates fixed Shard array and all kernel/shared runtime resources.
+/// Address-pinned: `*Runtime` must not be moved after `init` returns!
+pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void {
+    const resolved_count = if (options.shard_count) |n|
+        (if (n == 0) return error.InvalidCapacity else n)
+    else
+        @max(@as(usize, 1), std.Thread.getCpuCount() catch 1);
+
+    if (builtin.os.tag == .windows and resolved_count > 64) {
+        return error.InvalidCapacity;
+    }
+
+    const shards = try gpa.alloc(Shard, resolved_count);
+    errdefer gpa.free(shards);
+
+    const threads = try gpa.alloc(std.Thread, resolved_count);
+    errdefer gpa.free(threads);
+
+    self.* = .{
+        .gpa = gpa,
+        .shards = shards,
+        .threads = threads,
+        .thread_stack_size = options.thread_stack_size,
+    };
+
+    try self.blocking_pool.init(gpa, .{
+        .thread_count = options.blocking_threads,
+        .queue_capacity = options.blocking_queue_capacity,
+        .environ = options.environ,
+    });
+    errdefer self.blocking_pool.deinit(gpa);
+
+    self.mesh = try ShardMesh.init(gpa, resolved_count, options.mesh_ring_capacity);
+    errdefer self.mesh.deinit(gpa);
+
+    if (builtin.os.tag == .windows and resolved_count > 1) {
+        try self.acceptor.init(gpa, resolved_count, options.acceptor_inbox_capacity);
+        self.has_acceptor = true;
+    }
+    errdefer if (self.has_acceptor) self.acceptor.deinit(gpa);
+
+    var initialized_shards: usize = 0;
+    errdefer {
+        for (self.shards[0..initialized_shards]) |*s| s.deinitUnattached();
+    }
+
+    const shard_opts: Shard.InitOptions = .{
+        .stack_size = options.stack_size,
+        .max_cached_stacks = options.max_cached_stacks,
+        .max_fds = options.max_fds,
+        .environ = options.environ,
+    };
+
+    for (self.shards, 0..) |*s, idx| {
+        try s.initUnattached(gpa, shard_opts, .{
+            .shard_id = idx,
+            .shard_count = resolved_count,
+            .runtime_ptr = self,
+            .blocking_pool = &self.blocking_pool,
+            .futex_table = &self.futex_table,
+            .mesh = if (resolved_count > 1) &self.mesh else null,
+            .acceptor = if (self.has_acceptor) &self.acceptor else null,
+            .stderr_mutex = &self.stderr_mutex,
+        });
+        initialized_shards += 1;
+    }
+}
+
+pub fn deinit(self: *Runtime) void {
+    if (self.state == .running) {
+        self.requestStop();
+        self.joinThreadsOnly();
+    }
+    if (self.active_runner_ctx) |ctx| {
+        self.cleanup_runner_fn.?(self.gpa, ctx);
+        self.active_runner_ctx = null;
+        self.cleanup_runner_fn = null;
+    }
+
+    const gpa = self.gpa;
+    for (self.shards) |*s| s.deinitUnattached();
+    if (self.has_acceptor) self.acceptor.deinit(gpa);
+    self.mesh.deinit(gpa);
+    self.blocking_pool.deinit(gpa);
+    gpa.free(self.threads);
+    gpa.free(self.shards);
+    self.* = undefined;
+}
+
+pub fn shardCount(self: *const Runtime) usize {
+    return self.shards.len;
+}
+
+pub fn isStopping(self: *const Runtime) bool {
+    return self.stopping.load(.acquire);
+}
+
+/// Thread-safe: initiates graceful stop across all Shards and Windows Acceptor.
+pub fn requestStop(self: *Runtime) void {
+    self.stopping.store(true, .seq_cst);
+    if (self.has_acceptor) self.acceptor.requestStop();
+    for (self.shards) |*s| s.requestStop();
+}
+
+const EntryMode = enum {
+    io_only,
+    io_and_index,
+    shard_ptr,
+};
+
+fn classifyEntryFn(comptime Fn: type) struct { mode: EntryMode, prefix_params: usize } {
+    const info = @typeInfo(Fn).@"fn";
+    if (info.param_types.len == 0) @compileError("Runtime entry function must accept `std.Io` or `*islet.Shard` as its first parameter");
+    const P0 = info.param_types[0].?;
+    if (P0 == *Shard) {
+        return .{ .mode = .shard_ptr, .prefix_params = 1 };
+    }
+    if (P0 == Io) {
+        if (info.param_types.len >= 2 and info.param_types[1].? == usize) {
+            return .{ .mode = .io_and_index, .prefix_params = 2 };
+        }
+        return .{ .mode = .io_only, .prefix_params = 1 };
+    }
+    @compileError("Runtime entry function's first parameter must be `std.Io` or `*islet.Shard`");
+}
+
+pub fn ExtraArgsTuple(comptime Fn: type) type {
+    const info = @typeInfo(Fn).@"fn";
+    const meta = comptime classifyEntryFn(Fn);
+    const extra_len = info.param_types.len - meta.prefix_params;
+    var types: [extra_len]type = undefined;
+    for (0..extra_len) |i| {
+        types[i] = info.param_types[meta.prefix_params + i].?;
+    }
+    return @Tuple(&types);
+}
+
+pub fn EntryReturnErrorSet(comptime Fn: type) ?type {
+    const Ret = @typeInfo(Fn).@"fn".return_type.?;
+    return switch (@typeInfo(Ret)) {
+        .void => null,
+        .error_union => |eu| blk: {
+            if (eu.payload != void) @compileError("Runtime entry function must return `void` or `!void`");
+            break :blk eu.error_set;
+        },
+        else => @compileError("Runtime entry function must return `void` or `!void`"),
+    };
+}
+
+/// Phase 2 (non-blocking): spawns all Shard threads, waits on the startup
+/// readiness barrier until every Shard loop is attached, and returns while
+/// Shards execute `function` concurrently. Call `join()` to await completion.
+///
+/// Supported `function` signatures:
+/// - `fn (io: std.Io, ...extra_args) void` or `!void`
+/// - `fn (io: std.Io, shard_index: usize, ...extra_args) void` or `!void`
+/// - `fn (shard: *islet.Shard, ...extra_args) void` or `!void`
+pub fn start(
+    self: *Runtime,
+    comptime function: anytype,
+    extra_args: ExtraArgsTuple(@TypeOf(function)),
+) (Allocator.Error || Shard.AttachError || std.Thread.SpawnError)!void {
+    if (self.state != .initialized) {
+        @panic("islet.Runtime.start: Runtime can only be started once");
+    }
+
+    const Fn = @TypeOf(function);
+    const meta = comptime classifyEntryFn(Fn);
+    const MaybeErr = comptime EntryReturnErrorSet(Fn);
+    const Extra = ExtraArgsTuple(Fn);
+
+    const Runner = struct {
+        rt: *Runtime,
+        extra: Extra,
+        err_lock: Io.Mutex = .init,
+        first_err: if (MaybeErr) |E| ?E else void = if (MaybeErr != null) null else {},
+
+        fn cleanup(gpa: Allocator, raw: *anyopaque) void {
+            const r: *@This() = @ptrCast(@alignCast(raw));
+            gpa.destroy(r);
+        }
+
+        fn threadMain(r: *@This(), shard_idx: usize) void {
+            const rt = r.rt;
+            const shard = &rt.shards[shard_idx];
+            const kio = kernelIo();
+
+            shard.attachCurrentThread() catch {
+                rt.barrier_mutex.lockUncancelable(kio);
+                rt.barrier_failed = true;
+                rt.barrier_ready_count += 1;
+                rt.barrier_mutex.unlock(kio);
+                rt.barrier_cond.broadcast(kio);
+                return;
+            };
+            defer shard.detachCurrentThread();
+
+            // Two-phase startup barrier: wait until ALL Shards are attached (or one failed).
+            {
+                rt.barrier_mutex.lockUncancelable(kio);
+                rt.barrier_ready_count += 1;
+                if (rt.barrier_ready_count == rt.shards.len) {
+                    rt.barrier_cond.broadcast(kio);
+                } else {
+                    while (rt.barrier_ready_count < rt.shards.len and !rt.barrier_failed) {
+                        rt.barrier_cond.waitUncancelable(kio, &rt.barrier_mutex);
+                    }
+                }
+                const abort_startup = rt.barrier_failed;
+                rt.barrier_mutex.unlock(kio);
+                if (abort_startup) return;
+            }
+
+            const full_args = switch (meta.mode) {
+                .io_only => .{shard.io()} ++ r.extra,
+                .io_and_index => .{ shard.io(), shard_idx } ++ r.extra,
+                .shard_ptr => .{shard} ++ r.extra,
+            };
+
+            if (MaybeErr != null) {
+                @call(.auto, function, full_args) catch |err| {
+                    r.err_lock.lockUncancelable(kio);
+                    if (r.first_err == null) r.first_err = err;
+                    r.err_lock.unlock(kio);
+                    rt.requestStop();
+                };
+            } else {
+                @call(.auto, function, full_args);
+            }
+        }
+    };
+
+    const runner = try self.gpa.create(Runner);
+    runner.* = .{
+        .rt = self,
+        .extra = extra_args,
+    };
+    errdefer self.gpa.destroy(runner);
+
+    self.active_runner_ctx = runner;
+    self.cleanup_runner_fn = Runner.cleanup;
+    self.state = .running;
+    self.barrier_ready_count = 0;
+    self.barrier_failed = false;
+    self.spawned_threads = 0;
+
+    const kio = kernelIo();
+    for (self.threads, 0..) |*slot, idx| {
+        slot.* = std.Thread.spawn(.{
+            .stack_size = self.thread_stack_size,
+            .allocator = self.gpa,
+        }, Runner.threadMain, .{ runner, idx }) catch |err| {
+            self.barrier_mutex.lockUncancelable(kio);
+            self.barrier_failed = true;
+            self.barrier_mutex.unlock(kio);
+            self.barrier_cond.broadcast(kio);
+            for (self.threads[0..self.spawned_threads]) |t| t.join();
+            self.spawned_threads = 0;
+            self.state = .joined;
+            self.active_runner_ctx = null;
+            self.cleanup_runner_fn = null;
+            return err;
+        };
+        self.spawned_threads += 1;
+    }
+
+    // Wait on caller thread until all Shard threads pass the attach barrier.
+    self.barrier_mutex.lockUncancelable(kio);
+    while (self.barrier_ready_count < self.shards.len and !self.barrier_failed) {
+        self.barrier_cond.waitUncancelable(kio, &self.barrier_mutex);
+    }
+    const failed = self.barrier_failed;
+    self.barrier_mutex.unlock(kio);
+
+    if (failed) {
+        self.joinThreadsOnly();
+        self.active_runner_ctx = null;
+        self.cleanup_runner_fn = null;
+        return error.SystemResources;
+    }
+}
+
+/// Joins all Shard threads and cleans up the Windows Acceptor.
+/// Panics if called from inside one of this Runtime's own Shard threads!
+pub fn join(self: *Runtime) void {
+    self.assertNotSelfJoin();
+    if (self.state != .running) return;
+    self.joinThreadsOnly();
+}
+
+/// Convenience helper: runs `start(function, extra_args)`, joins all Shards,
+/// and propagates the first error if `function` returns `!void`.
+pub fn run(
+    self: *Runtime,
+    comptime function: anytype,
+    extra_args: ExtraArgsTuple(@TypeOf(function)),
+) RunResult(@TypeOf(function)) {
+    const Fn = @TypeOf(function);
+    const MaybeErr = comptime EntryReturnErrorSet(Fn);
+    try self.start(function, extra_args);
+
+    // Peek `first_err` from `Runner` before releasing it.
+    self.assertNotSelfJoin();
+    const raw_runner = self.active_runner_ctx.?;
+    self.joinThreadsOnly();
+
+    if (MaybeErr) |E| {
+        const Extra = ExtraArgsTuple(Fn);
+        const RunnerView = struct {
+            rt: *Runtime,
+            extra: Extra,
+            err_lock: Io.Mutex,
+            first_err: ?E,
+        };
+        const view: *RunnerView = @ptrCast(@alignCast(raw_runner));
+        const maybe_err = view.first_err;
+        self.cleanup_runner_fn.?(self.gpa, raw_runner);
+        self.active_runner_ctx = null;
+        self.cleanup_runner_fn = null;
+        if (maybe_err) |e| return e;
+    } else {
+        self.cleanup_runner_fn.?(self.gpa, raw_runner);
+        self.active_runner_ctx = null;
+        self.cleanup_runner_fn = null;
+    }
+}
+
+pub fn RunResult(comptime Fn: type) type {
+    const StartErr = Allocator.Error || Shard.AttachError || std.Thread.SpawnError;
+    if (EntryReturnErrorSet(Fn)) |E| {
+        return (StartErr || E)!void;
+    }
+    return StartErr!void;
+}
+
+fn assertNotSelfJoin(self: *const Runtime) void {
+    if (Shard.current()) |cur| {
+        if (cur.runtime_ptr == @as(?*const anyopaque, self)) {
+            @panic("islet.Runtime.join: self-join deadlock from a Shard thread");
+        }
+    }
+}
+
+fn joinThreadsOnly(self: *Runtime) void {
+    for (self.threads[0..self.spawned_threads]) |t| t.join();
+    self.spawned_threads = 0;
+    if (self.has_acceptor) self.acceptor.join();
+    self.state = .joined;
+}

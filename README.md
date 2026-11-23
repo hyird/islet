@@ -1,17 +1,54 @@
 # islet
 
-A shared-nothing `std.Io` backend for Zig `0.17.1`, with an independent native I/O loop per shard (`epoll` on Linux, `IOCP` on Windows).
+面向 Zig `0.17.1` 的 Shared-Nothing `std.Io` 后端实现，每个分片（Shard）独占独立 OS 线程与原生多路复用循环（Linux `epoll`、Windows `IOCP`）。
 
-## Prerequisites
+`islet` 仅对外暴露生命周期入口（`islet.Runtime`、`islet.Shard`）与标准 `std.Io` 实例，不暴露任何内部队列、多路复用器或线程池子模块。架构边界与并发契约见 `AGENTS.md`。
 
-- Zig `0.17.1` (managed via [mise](https://mise.jdx.dev/) using `mise.toml`)
+## 环境依赖
 
-## Build & Verify
+- Zig `0.17.1`（由仓库根 `mise.toml` 固定）
+
+## 快速接入
+
+### 多分片 `Runtime`
+
+```zig
+const std = @import("std");
+const islet = @import("islet");
+
+fn shardMain(io: std.Io, shard_index: usize) !void {
+    _ = shard_index;
+    try io.sleep(.fromMilliseconds(10), .awake);
+}
+
+pub fn main() !void {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+
+    var rt: islet.Runtime = undefined;
+    try rt.init(gpa_state.allocator(), .{ .shard_count = 4 });
+    defer rt.deinit();
+
+    try rt.run(shardMain, .{});
+}
+```
+
+### 单分片当前线程 `Shard`
+
+```zig
+var shard: islet.Shard = undefined;
+try shard.init(allocator, .{});
+defer shard.deinit();
+
+const io = shard.io();
+```
+
+## 构建与验证
 
 ```bash
-# Check formatting and cross-target compilation (Linux epoll + Windows IOCP)
+# 格式校验与四目标交叉编译（x86_64/aarch64 Linux epoll + Windows IOCP）
 mise x -- zig build check --summary all
 
-# Run host unit and integration tests
+# 本机单元与真实内核 E2E 测试
 mise x -- zig build test --summary all
 ```

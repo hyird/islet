@@ -12,6 +12,7 @@
 - **优先级顺序**：正确性与并发安全 > 长期可维护性 > 经实测证明的性能与内存收益。
 - **最小抽象（Less is More）**：能删则删、能简则简，至少两个真实调用方共享才提取复用抽象；严禁假想扩展点、单调用方泛型/策略层、无状态包装或将纯同步计算伪装成挂起操作。
 - **唯一契约与闭环迁移**：同类能力、状态机与系统调用封装只保留唯一入口与单一主链；拆分、合并或改名必须一次迁移全部符号、调用方、测试与构建配置，删除旧文件、兼容别名、死代码与只写不读统计，不引入无外部标准依据的内部版本号或代次后缀。
+- **纯后端公开边界**：包根（`src/root.zig`）仅对外暴露 `Runtime` / `Shard` 生命周期入口与 `std.Io` 适配实例，**严禁暴露任何内部子模块 API**（如 `SpscRing`、`Mailbox`、`ShardMesh`、`TimerHeap`、`BlockingPool`、`Epoll`、`Iocp`、`Fiber`、`Acceptor`）；跨分片协作、网络接入与文件/同步操作一律经标准 `std.Io` 契约透明承载。
 - **文件职责与拆分边界**：一个文件承载一个内聚职责（完整的类型族、平台多路复用器或同步原语），不设机械行数阈值，巨型单文件与碎片化壳文件同等违规；仅当同时承载两个以上独立演进状态机、或消除真实依赖传染且拆后可独立验证时才拆分，名实不符优先改名；共享同一组私有不变量且总共同修改的零散文件必须合并。
 - **遵循标准与系统契约**：严格遵循 Zig `0.17.1` `std.Io` 接口语义、Linux man-pages（`epoll(7)`、`eventfd(2)`、`socket(7)`）与 Microsoft Win32 / Winsock2 / IOCP 规范，区分内核保证与平台差异，不以主观臆断代替系统契约。
 - **源码与产物隔离**：源码、依赖缓存与生成产物严格分离；**严禁向 `/tmp` 写入构建缓存、测试临时文件或验证产物**（防内存文件系统耗尽），临时文件统一置于仓库 `build/` 或 `.zig-cache/` 下并在验证后立即清理。
@@ -58,9 +59,9 @@ flowchart TB
 | `runtime` | 固定 Shard 集合构造、两阶段启动栅栏、跨分片网格装配、全局停机与 `join` | 进入稳态 I/O 热路径、持有分片可变数据面对象 |
 
 - **单向无环依赖（DAG）**：模块 `@import` 严格保持自上而下单向无环；平台条件编译（`builtin.os.tag`）收敛在 `poller`、`fiber` 与系统调用转换层，禁止向通用调度与基础原语层扩散平台分支。
-- **平台监听接入拓扑**：
-  - **Linux（`epoll`）**：各业务 Shard 在各自事件循环独立绑定 `SO_REUSEPORT` 监听套接字并直接 `accept4`（置 `SOCK_NONBLOCK | SOCK_CLOEXEC`），由内核分发连接，零跨线程句柄移交。
-  - **Windows（`IOCP`）**：因无 `SO_REUSEPORT` 负载均衡且已绑定 IOCP 的内核 `SOCKET` 不可重绑至其他完成端口，多 Shard 监听由独立轻量 **Acceptor 线程**以 `SO_EXCLUSIVEADDRUSE` 独占持有，经 `AcceptEx` 接收**未关联任何 IOCP 的裸 `SOCKET`**，先预留目标 Shard 有界准入槽位再按值移交，由目标 Shard 接管时完成**首次且唯一一次** IOCP 绑定（被拒时由 Acceptor 立即关闭并计入拒绝计数）；单 Shard 直接调用 `netListenIp` / `netAccept` 时直接关联当前 Shard 自身 IOCP。
+- **平台监听接入拓扑（经 `std.Io` 透明承载）**：
+  - **Linux（`epoll`）**：各业务 Shard 调用 `netListenIp`（`reuse_address` 置 `SO_REUSEADDR | SO_REUSEPORT`）在各自事件循环独立绑定监听套接字并直接 `accept4`（置 `SOCK_NONBLOCK | SOCK_CLOEXEC`），由内核分发连接，零跨线程句柄移交。
+  - **Windows（`IOCP`）**：因无 `SO_REUSEPORT` 负载均衡且已绑定 IOCP 的内核 `SOCKET` 不可重绑至其他完成端口，多 Shard `Runtime` 下启用 `reuse_address` 的 `netListenIp` / `netAccept` 在内部透明委托独立轻量 **Acceptor 线程**（以 `SO_EXCLUSIVEADDRUSE` 独占绑定，经 `AcceptEx` 接收**未关联任何 IOCP 的裸 `SOCKET`**，先预留目标 Shard 有界准入槽位再按值移交，由目标 Shard 在 `netAccept` 接管时完成**首次且唯一一次** IOCP 绑定，被拒时由 Acceptor 立即关闭并计入拒绝统计）；单 Shard 或非共享监听直接关联当前 Shard 自身 IOCP。
 
 ---
 

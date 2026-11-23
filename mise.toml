@@ -1,0 +1,28 @@
+[tools]
+zig = "0.17.1"
+
+[env]
+ZIG_LOCAL_CACHE_DIR = "{{config_root}}/.zig-cache"
+TMPDIR = "{{config_root}}/build/tmp"
+
+[tasks.fmt]
+description = "Format all Zig sources in place"
+run = "zig fmt build.zig build.zig.zon src"
+
+[tasks."fmt:check"]
+description = "Verify Zig formatting without modifying files"
+run = "zig fmt --check build.zig build.zig.zon src"
+
+[tasks.check]
+description = "Verify formatting and cross-target compilation (Linux epoll + Windows IOCP)"
+run = '''
+mkdir -p "$TMPDIR"
+zig build check --summary all
+'''
+
+[tasks.test]
+description = "Run unit and E2E tests on the host target"
+run = '''
+mkdir -p "$TMPDIR"
+zig build test --summary all
+'''

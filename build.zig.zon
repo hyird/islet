@@ -1,0 +1,13 @@
+.{
+    .name = .islet,
+    .version = "0.1.0",
+    .fingerprint = 0x25a5f5d05489338d, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

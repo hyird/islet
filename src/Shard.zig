@@ -48,18 +48,12 @@ pub const InitOptions = struct {
     max_cached_stacks: usize = fiber.default_max_cached_stacks,
     /// Upper bound on file descriptor index per Shard on Linux.
     max_fds: u32 = 65536,
-    /// Worker count for private `BlockingPool` in standalone single-Shard mode.
-    blocking_threads: ?usize = null,
-    /// Admission queue bound for private `BlockingPool` in standalone mode.
-    blocking_queue_capacity: ?usize = null,
-    /// Optional process environment block for child process spawning.
-    environ: std.process.Environ = .empty,
 };
 
 pub const SharedServices = struct {
     shard_id: usize,
     shard_count: usize,
-    runtime_ptr: ?*anyopaque,
+    runtime_ptr: *const anyopaque,
     blocking_pool: *BlockingPool,
     futex_table: *FutexTable,
     mesh: ?*ShardMesh,
@@ -69,10 +63,7 @@ pub const SharedServices = struct {
 
 pub const AttachError = fiber.InitError;
 
-pub const InitError = Allocator.Error ||
-    AttachError ||
-    PlatformIo.InitError ||
-    std.Thread.SpawnError;
+pub const InitError = Allocator.Error || PlatformIo.InitError;
 
 threadlocal var tls_current_shard: ?*Shard = null;
 
@@ -193,7 +184,7 @@ const ReadyQueue = struct {
 gpa: Allocator,
 id: usize,
 shard_count: usize,
-runtime_ptr: ?*anyopaque,
+runtime_ptr: *const anyopaque,
 
 driver: PlatformIo = undefined,
 timers: TimerHeap = .init,
@@ -201,12 +192,9 @@ stack_pool: fiber.StackPool,
 resume_lane: ResumeLane = .init,
 
 blocking_pool: *BlockingPool,
-owned_blocking_pool: ?*BlockingPool = null,
 futex_table: *FutexTable,
-owned_futex_table: ?*FutexTable = null,
 mesh: ?*ShardMesh = null,
 stderr_mutex: *Io.Mutex,
-owned_stderr_mutex: Io.Mutex = .init,
 
 thread_ctx: fiber.ThreadContext = undefined,
 idle_fiber: *fiber.RawFiber = undefined,
@@ -234,54 +222,14 @@ stderr_initialized: bool = false,
 stderr_locker: ?*Task = null,
 stderr_lock_count: usize = 0,
 
-/// Initializes a standalone single-Shard `std.Io` backend bound to the calling OS thread.
+/// Phase-1 in-place initializer invoked by `Runtime` before spawning Shard threads.
 /// Address-pinned (`*Shard` must not be moved after `init` returns).
-pub fn init(self: *Shard, gpa: Allocator, options: InitOptions) InitError!void {
-    if (tls_current_shard != null) {
-        @panic("islet.Shard.init: calling thread already owns an active Shard");
-    }
-
-    const owned_pool = try gpa.create(BlockingPool);
-    errdefer gpa.destroy(owned_pool);
-    try owned_pool.init(gpa, .{
-        .thread_count = options.blocking_threads,
-        .queue_capacity = options.blocking_queue_capacity,
-        .environ = options.environ,
-    });
-    errdefer owned_pool.deinit(gpa);
-
-    const owned_futex = try gpa.create(FutexTable);
-    errdefer gpa.destroy(owned_futex);
-    owned_futex.* = .init;
-
-    try self.initUnattached(gpa, options, .{
-        .shard_id = 0,
-        .shard_count = 1,
-        .runtime_ptr = null,
-        .blocking_pool = owned_pool,
-        .futex_table = owned_futex,
-        .mesh = null,
-        .acceptor = null,
-        .stderr_mutex = &self.owned_stderr_mutex,
-    });
-    self.owned_blocking_pool = owned_pool;
-    self.owned_futex_table = owned_futex;
-    errdefer {
-        self.owned_blocking_pool = null;
-        self.owned_futex_table = null;
-        self.deinitUnattached();
-    }
-
-    try self.attachCurrentThread();
-}
-
-/// Package-internal phase-1 initializer used by `Runtime` before spawning Shard threads.
-pub fn initUnattached(
+pub fn init(
     self: *Shard,
     gpa: Allocator,
     options: InitOptions,
     services: SharedServices,
-) (Allocator.Error || PlatformIo.InitError)!void {
+) InitError!void {
     self.* = .{
         .gpa = gpa,
         .id = services.shard_id,
@@ -308,7 +256,7 @@ pub fn initUnattached(
     );
 }
 
-/// Package-internal phase-2 binder invoked on the Shard's dedicated OS thread.
+/// Phase-2 binder invoked on the Shard's dedicated OS thread.
 pub fn attachCurrentThread(self: *Shard) AttachError!void {
     if (tls_current_shard != null) {
         @panic("islet.Shard: one OS thread cannot run multiple Shards");
@@ -331,10 +279,10 @@ pub fn attachCurrentThread(self: *Shard) AttachError!void {
 pub fn detachCurrentThread(self: *Shard) void {
     self.assertAffinity();
     if (self.current_task != &self.main_task) {
-        @panic("islet.Shard.deinit: must be called from the Shard's root context");
+        @panic("islet.Shard: must detach from the Shard's root context");
     }
     if (self.active_tasks != 0) {
-        @panic("islet.Shard.deinit: active Future or Group tasks were not awaited or canceled");
+        @panic("islet.Shard: active Future or Group tasks were not awaited or canceled");
     }
 
     self.timers.cancelAll();
@@ -350,41 +298,12 @@ pub fn detachCurrentThread(self: *Shard) void {
     self.thread_ctx.deinit();
 }
 
-pub fn deinitUnattached(self: *Shard) void {
+pub fn deinit(self: *Shard) void {
     assert(!self.attached_to_thread);
     self.timers.deinit(self.gpa);
     self.stack_pool.deinit(self.gpa);
     self.driver.deinit(self.gpa);
-}
-
-pub fn deinit(self: *Shard) void {
-    if (self.attached_to_thread) {
-        self.detachCurrentThread();
-    }
-    const gpa = self.gpa;
-    const maybe_pool = self.owned_blocking_pool;
-    const maybe_futex = self.owned_futex_table;
-    self.owned_blocking_pool = null;
-    self.owned_futex_table = null;
-
-    self.deinitUnattached();
-
-    if (maybe_pool) |pool| {
-        pool.deinit(gpa);
-        gpa.destroy(pool);
-    }
-    if (maybe_futex) |ft| {
-        gpa.destroy(ft);
-    }
     self.* = undefined;
-}
-
-pub fn index(self: *const Shard) usize {
-    return self.id;
-}
-
-pub fn count(self: *const Shard) usize {
-    return self.shard_count;
 }
 
 pub fn isStopping(self: *const Shard) bool {

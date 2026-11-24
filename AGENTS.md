@@ -8,7 +8,7 @@
 ## 1. 核心铁律：Less is More 与最小边界
 
 1. **能删则删、能简则简**：单一机制能满足契约时严禁叠加平行通道或复杂快慢双轨分支；至少两个真实调用方共享才提取复用抽象；严禁假想扩展点、单调用方泛型/策略层、无状态薄包装，或将纯同步计算伪装成异步挂起。
-2. **纯后端极简公开边界**：包根（`src/root.zig`）**仅**对外暴露 `Io`（`std.Io`）、`Shard` 与 `Runtime`，严禁暴露任何内部子模块（`SpscRing`、`Mailbox`、`ShardMesh`、`TimerHeap`、`FutexTable`、`BlockingPool`、`Epoll`、`Iocp`、`fiber`、`Acceptor`）；一切并发、网络、文件与同步能力经标准 `std.Io` 透明承载。
+2. **纯后端极简公开边界**：包根（`src/root.zig`）**仅**对外暴露唯一生命周期入口 `Runtime`，严禁暴露任何内部子模块（`Shard`、`SpscRing`、`Mailbox`、`ShardMesh`、`TimerHeap`、`FutexTable`、`BlockingPool`、`Epoll`、`Iocp`、`fiber`、`Acceptor`）或标准库类型别名；一切并发、网络、文件与同步能力经标准 `std.Io` 透明承载。
 3. **唯一主链与闭环清理**：同类能力、状态机与系统调用封装只保留唯一入口；拆分、合并或改名须一次迁移全部调用方、测试与构建配置，彻底删除旧文件、兼容别名、死代码与只写不读统计，严禁引入无外部标准依据的代次后缀。
 
 ---
@@ -62,7 +62,7 @@ flowchart TB
 
 | 结果类别 | Zig 表达形状 | 典型场景与约束 |
 | :--- | :--- | :--- |
-| **生命周期与线程亲和违规** | 无条件 `@panic` | 跨线程调用 `shard.io()`、销毁含未收束任务的宿主、自等待 `join`、在途 `OVERLAPPED` 未排空即释放 |
+| **生命周期与线程亲和违规** | 无条件 `@panic` | 跨线程使用分片专属 `std.Io`、销毁含未收束任务的宿主、自等待 `join`、在途 `OVERLAPPED` 未排空即释放 |
 | **内核报告的调用契约缺陷** | `errnoBug`（安全模式断言，发布模式归 `error.Unexpected`） | 对受管有效句柄收到 `EBADF`、`EFAULT` 或非法内部标志 `EINVAL` |
 | **预期外部 / I/O / 取消 / 超时错误** | 精确具名错误集 `Error!T`（**禁公开或跨模块写 `anyerror`**） | `error.Canceled`、`error.Timeout`、`Io.Operation.*.Error`、`Allocator.Error`；未知系统码经 `unexpectedErrno` / `unexpectedError` 归为 `error.Unexpected` |
 | **正常进展、准入与背压** | 显式状态 `enum` 或带退回载荷的 `union(enum)` | `SpscRing` 满、`Mailbox` 背压/已关闭、非阻塞探针 `would_block`（背压不是异常错误） |

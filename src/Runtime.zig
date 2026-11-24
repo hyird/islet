@@ -46,7 +46,10 @@ pub const InitOptions = struct {
     environ: std.process.Environ = .empty,
 };
 
-pub const InitError = Shard.InitError || SpscRingMod.InitError || error{InvalidCapacity};
+pub const InitError = Shard.InitError ||
+    SpscRingMod.InitError ||
+    std.Thread.SpawnError ||
+    error{InvalidCapacity};
 
 const State = enum(u8) {
     initialized,
@@ -117,18 +120,17 @@ pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void
 
     var initialized_shards: usize = 0;
     errdefer {
-        for (self.shards[0..initialized_shards]) |*s| s.deinitUnattached();
+        for (self.shards[0..initialized_shards]) |*s| s.deinit();
     }
 
     const shard_opts: Shard.InitOptions = .{
         .stack_size = options.stack_size,
         .max_cached_stacks = options.max_cached_stacks,
         .max_fds = options.max_fds,
-        .environ = options.environ,
     };
 
     for (self.shards, 0..) |*s, idx| {
-        try s.initUnattached(gpa, shard_opts, .{
+        try s.init(gpa, shard_opts, .{
             .shard_id = idx,
             .shard_count = resolved_count,
             .runtime_ptr = self,
@@ -149,7 +151,7 @@ pub fn deinit(self: *Runtime) void {
     }
 
     const gpa = self.gpa;
-    for (self.shards) |*s| s.deinitUnattached();
+    for (self.shards) |*s| s.deinit();
     self.acceptor.deinit(gpa);
     self.mesh.deinit(gpa);
     self.blocking_pool.deinit(gpa);
@@ -176,23 +178,17 @@ pub fn requestStop(self: *Runtime) void {
 const EntryMode = enum {
     io_only,
     io_and_index,
-    shard_ptr,
 };
 
 fn classifyEntryFn(comptime Fn: type) struct { mode: EntryMode, prefix_params: usize } {
     const info = @typeInfo(Fn).@"fn";
-    if (info.param_types.len == 0) @compileError("Runtime entry function must accept `std.Io` or `*islet.Shard` as its first parameter");
-    const P0 = info.param_types[0].?;
-    if (P0 == *Shard) {
-        return .{ .mode = .shard_ptr, .prefix_params = 1 };
+    if (info.param_types.len == 0 or info.param_types[0].? != Io) {
+        @compileError("Runtime entry function must accept `std.Io` as its first parameter");
     }
-    if (P0 == Io) {
-        if (info.param_types.len >= 2 and info.param_types[1].? == usize) {
-            return .{ .mode = .io_and_index, .prefix_params = 2 };
-        }
-        return .{ .mode = .io_only, .prefix_params = 1 };
+    if (info.param_types.len >= 2 and info.param_types[1].? == usize) {
+        return .{ .mode = .io_and_index, .prefix_params = 2 };
     }
-    @compileError("Runtime entry function's first parameter must be `std.Io` or `*islet.Shard`");
+    return .{ .mode = .io_only, .prefix_params = 1 };
 }
 
 pub fn ExtraArgsTuple(comptime Fn: type) type {
@@ -232,7 +228,6 @@ fn ErrorCapture(comptime E: type) type {
 /// Supported `function` signatures:
 /// - `fn (io: std.Io, ...extra_args) void` or `!void`
 /// - `fn (io: std.Io, shard_index: usize, ...extra_args) void` or `!void`
-/// - `fn (shard: *islet.Shard, ...extra_args) void` or `!void`
 pub fn start(
     self: *Runtime,
     comptime function: anytype,
@@ -301,7 +296,6 @@ fn startInternal(
             const full_args = switch (meta.mode) {
                 .io_only => .{shard.io()} ++ r.extra,
                 .io_and_index => .{ shard.io(), shard_idx } ++ r.extra,
-                .shard_ptr => .{shard} ++ r.extra,
             };
 
             if (MaybeErr != null) {
@@ -401,7 +395,7 @@ pub fn RunResult(comptime Fn: type) type {
 
 fn assertNotSelfJoin(self: *const Runtime) void {
     if (Shard.current()) |cur| {
-        if (cur.runtime_ptr == @as(?*const anyopaque, self)) {
+        if (cur.runtime_ptr == @as(*const anyopaque, self)) {
             @panic("islet.Runtime.join: self-join deadlock from a Shard thread");
         }
     }

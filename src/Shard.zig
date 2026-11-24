@@ -229,6 +229,8 @@ csprng: Threaded.Csprng = .uninitialized,
 stderr_writer: File.Writer = undefined,
 stderr_mode: Io.Terminal.Mode = .no_color,
 stderr_initialized: bool = false,
+stderr_locker: ?*Task = null,
+stderr_lock_count: usize = 0,
 
 /// Initializes a standalone single-Shard `std.Io` backend bound to the calling OS thread.
 /// Address-pinned (`*Shard` must not be moved after `init` returns).
@@ -553,7 +555,9 @@ fn idleFiberEntry(arg: *anyopaque) void {
             // `io_poll_cadence` reached while CPU tasks remain ready: run nonblocking poll(0).
             self.steps_since_poll = 0;
             _ = self.drainIncoming();
-            _ = self.timers.fireExpired(self.awakeNowNs());
+            if (self.timers.hasActive()) {
+                _ = self.timers.fireExpired(self.awakeNowNs());
+            }
             _ = self.driver.poll(0);
             if (self.popNextReady()) |next_task| {
                 self.steps_since_poll = 1;
@@ -567,7 +571,12 @@ fn idleFiberEntry(arg: *anyopaque) void {
         }
 
         _ = self.drainIncoming();
-        _ = self.timers.fireExpired(self.awakeNowNs());
+        var pre_poll_now: ?i96 = null;
+        if (self.timers.hasActive()) {
+            const now_ns = self.awakeNowNs();
+            pre_poll_now = now_ns;
+            _ = self.timers.fireExpired(now_ns);
+        }
 
         if (self.popNextReady()) |next_task| {
             self.steps_since_poll = 1;
@@ -590,9 +599,8 @@ fn idleFiberEntry(arg: *anyopaque) void {
             continue;
         }
 
-        const post_check_now = self.awakeNowNs();
         const wait_ns: ?i96 = if (self.timers.peekDeadlineNs()) |dl|
-            time.subNsSat(dl, post_check_now)
+            time.subNsSat(dl, pre_poll_now orelse self.awakeNowNs())
         else
             null;
 
@@ -601,7 +609,9 @@ fn idleFiberEntry(arg: *anyopaque) void {
         self.driver.disarmDoorbell();
 
         _ = self.drainIncoming();
-        _ = self.timers.fireExpired(self.awakeNowNs());
+        if (self.timers.hasActive()) {
+            _ = self.timers.fireExpired(self.awakeNowNs());
+        }
 
         if (self.popNextReady()) |next_task| {
             self.steps_since_poll = 1;
@@ -857,9 +867,54 @@ fn vtableAwait(
     const child: *Task = @ptrCast(@alignCast(any_future));
     assert(child.kind == .future);
 
-    while (!child.finished) {
-        child.awaiter = self.current_task;
-        self.suspendCurrent();
+    const cur = self.current_task;
+    if (!child.finished) {
+        const AwaitCancelState = struct {
+            parent: *Task,
+            child_task: *Task,
+            propagated: bool = false,
+            child_pre_ack: bool = false,
+
+            fn propagate(s: *Shard, st: *@This()) void {
+                if (st.propagated or st.child_task.finished) return;
+                if (st.parent.shouldCancelNow()) {
+                    st.parent.acknowledgeCancel();
+                    st.propagated = true;
+                    st.child_pre_ack = st.child_task.cancel_protection.acknowledged;
+                    st.child_task.requestCancel(s);
+                }
+            }
+
+            fn onCancel(s: *Shard, raw_ctx: *anyopaque) void {
+                const st: *@This() = @ptrCast(@alignCast(raw_ctx));
+                propagate(s, st);
+            }
+        };
+
+        var cancel_st: AwaitCancelState = .{
+            .parent = cur,
+            .child_task = child,
+        };
+        AwaitCancelState.propagate(self, &cancel_st);
+
+        if (!child.finished) {
+            cur.cancel_hook = .{ .ctx = &cancel_st, .trigger = AwaitCancelState.onCancel };
+            defer cur.cancel_hook = null;
+
+            while (!child.finished) {
+                child.awaiter = cur;
+                self.suspendCurrent();
+            }
+        }
+
+        // Preserve single-acknowledgement cancellation semantics (`std.Io.Threaded.await`):
+        // if `child` did not consume the cancel we propagated, restore it on `cur`.
+        if (cancel_st.propagated) {
+            const child_consumed = !cancel_st.child_pre_ack and child.cancel_protection.acknowledged;
+            if (!child_consumed) {
+                cur.cancel_protection.recancel();
+            }
+        }
     }
 
     if (result.len > 0) {
@@ -885,6 +940,8 @@ fn vtableCancel(
     const child: *Task = @ptrCast(@alignCast(any_future));
     assert(child.kind == .future);
     child.requestCancel(self);
+    const prev = vtableSwapCancelProtection(self, .blocked);
+    defer _ = vtableSwapCancelProtection(self, prev);
     vtableAwait(userdata, any_future, result, result_alignment);
 }
 
@@ -1319,7 +1376,7 @@ pub fn callBlocking(
             .notify_ctx = self,
             .notify_fn = notifyOpaque,
         };
-        switch (self.blocking_pool.submit(&ctx.job)) {
+        switch (self.blocking_pool.submitWaitable(&ctx.job)) {
             .accepted => break,
             .queue_full => {
                 if (can_cancel) {
@@ -1524,13 +1581,31 @@ fn vtableRandomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!
     }.run, .{buffer});
 }
 
-fn ensureStderrInitialized(self: *Shard, maybe_mode: ?Io.Terminal.Mode) Io.Cancelable!void {
+fn ensureStderrInitialized(self: *Shard) void {
     const io_inst = self.ioUnchecked();
     if (!self.stderr_initialized) {
+        const prev = vtableSwapCancelProtection(self, .blocked);
+        defer _ = vtableSwapCancelProtection(self, prev);
+
         const stderr_file = File.stderr();
-        self.stderr_mode = maybe_mode orelse blk: {
-            const is_tty = try stderr_file.isTty(io_inst);
-            break :blk if (is_tty) .escape_codes else .no_color;
+        const t = &self.blocking_pool.threaded;
+        const kio = Io.Threaded.global_single_threaded.io();
+        t.mutex.lockUncancelable(kio);
+        if (!t.environ_initialized) {
+            t.environ.scan(t.allocator);
+            t.environ_initialized = true;
+        }
+        const no_color = t.environ.exist.NO_COLOR;
+        const clicolor_force = t.environ.exist.CLICOLOR_FORCE;
+        t.mutex.unlock(kio);
+
+        self.stderr_mode = Io.Terminal.Mode.detect(
+            io_inst,
+            stderr_file,
+            no_color,
+            clicolor_force,
+        ) catch |err| switch (err) {
+            error.Canceled => unreachable,
         };
         self.stderr_writer = .{
             .io = io_inst,
@@ -1541,36 +1616,69 @@ fn ensureStderrInitialized(self: *Shard, maybe_mode: ?Io.Terminal.Mode) Io.Cance
         self.stderr_initialized = true;
     } else {
         self.stderr_writer.io = io_inst;
-        if (maybe_mode) |m| self.stderr_mode = m;
     }
 }
 
 fn vtableLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
     const self = fromUserdata(userdata);
-    try self.stderr_mutex.lock(self.ioUnchecked());
-    errdefer self.stderr_mutex.unlock(self.ioUnchecked());
-    try self.ensureStderrInitialized(terminal_mode);
+    const cur = self.current_task;
+    if (self.stderr_locker != cur) {
+        try self.stderr_mutex.lock(self.ioUnchecked());
+        assert(self.stderr_lock_count == 0);
+        self.stderr_locker = cur;
+    }
+    self.stderr_lock_count += 1;
+    self.ensureStderrInitialized();
     return .{
         .file_writer = &self.stderr_writer,
-        .terminal_mode = self.stderr_mode,
+        .terminal_mode = terminal_mode orelse self.stderr_mode,
     };
 }
 
 fn vtableTryLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    if (!self.stderr_mutex.tryLock()) return null;
-    errdefer self.stderr_mutex.unlock(self.ioUnchecked());
-    try self.ensureStderrInitialized(terminal_mode);
+    const cur = self.current_task;
+    if (self.stderr_locker != cur) {
+        if (!self.stderr_mutex.tryLock()) return null;
+        assert(self.stderr_lock_count == 0);
+        self.stderr_locker = cur;
+    }
+    self.stderr_lock_count += 1;
+    self.ensureStderrInitialized();
     return .{
         .file_writer = &self.stderr_writer,
-        .terminal_mode = self.stderr_mode,
+        .terminal_mode = terminal_mode orelse self.stderr_mode,
     };
 }
 
 fn vtableUnlockStderr(userdata: ?*anyopaque) void {
     const self = fromUserdata(userdata);
-    self.stderr_mutex.unlock(self.ioUnchecked());
+    assert(self.stderr_locker == self.current_task);
+    assert(self.stderr_lock_count > 0);
+
+    if (self.stderr_writer.err == null) {
+        self.stderr_writer.interface.flush() catch {};
+    }
+    if (self.stderr_writer.err) |err| {
+        switch (err) {
+            error.Canceled => {
+                if (self.current_task.cancel_protection.acknowledged) {
+                    self.current_task.cancel_protection.recancel();
+                }
+            },
+            else => {},
+        }
+        self.stderr_writer.err = null;
+    }
+    self.stderr_writer.interface.end = 0;
+    self.stderr_writer.interface.buffer = &.{};
+
+    self.stderr_lock_count -= 1;
+    if (self.stderr_lock_count == 0) {
+        self.stderr_locker = null;
+        self.stderr_mutex.unlock(self.ioUnchecked());
+    }
 }
 
 // ── VTable: `Dir` & `File` & `MemoryMap` & `Process` Delegation ──────────────
@@ -1663,11 +1771,7 @@ fn vtableFileWriteFileStreaming(
 ) File.Writer.WriteFileError!usize {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    _ = file;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    return error.Unimplemented;
+    return self.driver.fileWriteFileStreaming(self, file, header, file_reader, limit);
 }
 
 fn vtableFileWriteFilePositional(
@@ -1680,12 +1784,7 @@ fn vtableFileWriteFilePositional(
 ) File.WriteFilePositionalError!usize {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    _ = file;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    _ = offset;
-    return error.Unimplemented;
+    return self.driver.fileWriteFilePositional(self, file, header, file_reader, limit, offset);
 }
 
 fn vtableProcessSpawn(
@@ -1793,11 +1892,7 @@ fn vtableNetWriteFile(
 ) net.Stream.Writer.WriteFileError!usize {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    _ = handle;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    return error.Unimplemented;
+    return self.driver.netWriteFile(self, handle, header, file_reader, limit);
 }
 
 fn vtableNetClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {

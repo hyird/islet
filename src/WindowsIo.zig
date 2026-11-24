@@ -51,9 +51,41 @@ const AcceptWaiter = struct {
 };
 
 const SharedAcceptQueue = struct {
-    items: std.ArrayListUnmanaged(AcceptedSocket) = .empty,
+    ring: []AcceptedSocket = &.{},
+    head: usize = 0,
+    tail: usize = 0,
     waiter_head: ?*AcceptWaiter = null,
     waiter_tail: ?*AcceptWaiter = null,
+
+    inline fn len(self: *const SharedAcceptQueue) usize {
+        return self.tail -% self.head;
+    }
+
+    fn pushBounded(self: *SharedAcceptQueue, gpa: Allocator, max_cap: u32, item: AcceptedSocket) bool {
+        if (self.ring.len == 0) {
+            const pow2_cap = std.math.ceilPowerOfTwoAssert(usize, @max(@as(usize, 16), max_cap));
+            self.ring = gpa.alloc(AcceptedSocket, pow2_cap) catch return false;
+        }
+        if (self.len() >= self.ring.len) return false;
+        self.ring[self.tail & (self.ring.len - 1)] = item;
+        self.tail +%= 1;
+        return true;
+    }
+
+    fn popFront(self: *SharedAcceptQueue) ?AcceptedSocket {
+        if (self.head == self.tail) return null;
+        const item = self.ring[self.head & (self.ring.len - 1)];
+        self.head +%= 1;
+        return item;
+    }
+
+    fn deinit(self: *SharedAcceptQueue, gpa: Allocator) void {
+        while (self.popFront()) |item| {
+            if (item.raw_sock != win32.INVALID_SOCKET) _ = win32.closesocket(item.raw_sock);
+        }
+        if (self.ring.len != 0) gpa.free(self.ring);
+        self.* = .{};
+    }
 };
 
 const BatchOp = struct {
@@ -129,10 +161,7 @@ pub fn deinit(self: *WindowsIo, gpa: Allocator) void {
         cur = next;
     }
     for (&self.shared_accepts) |*q| {
-        for (q.items.items) |item| {
-            if (item.raw_sock != win32.INVALID_SOCKET) _ = win32.closesocket(item.raw_sock);
-        }
-        q.items.deinit(gpa);
+        q.deinit(gpa);
     }
     self.poller.deinit(gpa);
     self.* = undefined;
@@ -186,10 +215,11 @@ fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
         self.wake_task_fn(self.owner_ctx, w.task_ptr);
         return;
     }
-    q.items.append(self.gpa, accepted) catch {
-        self.acceptor.?.noteShardSocketAdopted(self.shard_id);
+    const acc = self.acceptor.?;
+    if (!q.pushBounded(self.gpa, acc.inboxCapacity(), accepted)) {
+        acc.noteShardSocketDropped(self.shard_id);
         _ = win32.closesocket(accepted.raw_sock);
-    };
+    }
 }
 
 pub fn onStopRequested(self: *WindowsIo) void {
@@ -248,6 +278,90 @@ pub fn dirClose(_: *WindowsIo, shard: anytype, dirs: []const Dir) void {
             t_io.vtable.dirClose(t_io.userdata, ds);
         }
     }.run, .{dirs});
+}
+
+pub fn fileWriteFileStreaming(
+    self: *WindowsIo,
+    shard: anytype,
+    file: File,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+) File.Writer.WriteFileError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+    if (reader_buffered.len >= @backingInt(limit)) {
+        const op_res = try self.operate(shard, .{ .file_write_streaming = .{
+            .file = file,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.file_write_streaming;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (header.len != 0 or reader_buffered.len != 0) {
+                const op_res = try self.operate(shard, .{ .file_write_streaming = .{
+                    .file = file,
+                    .header = header,
+                    .data = &.{limit.slice(reader_buffered)},
+                    .splat = 1,
+                } });
+                const n = try op_res.file_write_streaming;
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return error.EndOfStream;
+        }
+    }
+    return error.Unimplemented;
+}
+
+pub fn fileWriteFilePositional(
+    _: *WindowsIo,
+    shard: anytype,
+    file: File,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+    offset: u64,
+) File.WriteFilePositionalError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+    const shard_io = shard.io();
+    if (reader_buffered.len >= @backingInt(limit)) {
+        const n = try shard_io.vtable.fileWritePositional(
+            shard_io.userdata,
+            file,
+            header,
+            &.{limit.slice(reader_buffered)},
+            1,
+            offset,
+        );
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (header.len != 0 or reader_buffered.len != 0) {
+                const n = try shard_io.vtable.fileWritePositional(
+                    shard_io.userdata,
+                    file,
+                    header,
+                    &.{limit.slice(reader_buffered)},
+                    1,
+                    offset,
+                );
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return error.EndOfStream;
+        }
+    }
+    return error.Unimplemented;
 }
 
 pub fn processSpawn(_: *WindowsIo, shard: anytype, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
@@ -1263,8 +1377,8 @@ fn acceptFromAcceptor(self: *WindowsIo, shard: anytype, acc: *Acceptor, listener
 
     const ShardPtr = @TypeOf(shard);
     const q = &self.shared_accepts[listener_id];
-    const conn: AcceptedSocket = if (q.items.items.len > 0)
-        q.items.orderedRemove(0)
+    const conn: AcceptedSocket = if (q.popFront()) |queued|
+        queued
     else blk: {
         if (shard.isStopping()) return error.SocketNotListening;
         const cur = shard.current_task;
@@ -1470,8 +1584,102 @@ pub fn netListenUnix(
     return handle;
 }
 
-pub fn netConnectUnix(_: *WindowsIo, _: anytype, _: *const net.UnixAddress) net.UnixAddress.ConnectError!net.Socket.Handle {
-    return error.AddressFamilyUnsupported;
+pub fn netConnectUnix(
+    self: *WindowsIo,
+    shard: anytype,
+    ua: *const net.UnixAddress,
+) net.UnixAddress.ConnectError!net.Socket.Handle {
+    if (!net.has_unix_sockets) return error.AddressFamilyUnsupported;
+    const sock = win32.WSASocketW(
+        win32.ws2_32.AF.UNIX,
+        win32.ws2_32.SOCK.STREAM,
+        0,
+        null,
+        0,
+        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
+    );
+    if (sock == win32.INVALID_SOCKET) return error.AddressFamilyUnsupported;
+    errdefer _ = win32.closesocket(sock);
+
+    var local_un: posix.sockaddr.un = .{ .family = win32.ws2_32.AF.UNIX, .path = @splat(0) };
+    const unnamed_len: c_int = @intCast(@offsetOf(posix.sockaddr.un, "path"));
+    if (win32.bind(sock, @ptrCast(&local_un), unnamed_len) == win32.SOCKET_ERROR) {
+        return error.Unexpected;
+    }
+
+    const handle = win32.socketToHandle(sock);
+    self.poller.associateSocket(self.gpa, sock, 0) catch return error.SystemResources;
+    errdefer self.poller.unregisterHandle(handle);
+
+    const connect_ex = try Iocp.resolveConnectEx(sock);
+    var dest_un: posix.sockaddr.un = undefined;
+    const dest_len = fillUnixSockaddr(ua, &dest_un);
+    var comp: Iocp.Completion = .{ .callback = undefined };
+    const ok = connect_ex(sock, @ptrCast(&dest_un), @intCast(dest_len), null, 0, null, &comp.overlapped);
+    if (!(ok.toBool() and self.poller.hasSkipOnSuccess(handle))) {
+        if (!ok.toBool()) {
+            const werr = win32.WSAGetLastError();
+            if (werr != win32.WSA_IO_PENDING) {
+                return switch (werr) {
+                    win32.WSAECONNREFUSED => error.ConnectionRefused,
+                    win32.WSAEACCES => error.AccessDenied,
+                    win32.WSAENOBUFS => error.SystemResources,
+                    else => error.FileNotFound,
+                };
+            }
+        }
+        self.poller.recordPending(&comp);
+        const res = try self.awaitPending(shard, handle, &comp, null);
+        if (res.nt_status != .SUCCESS) {
+            return switch (@as(c_int, @intCast(Iocp.ntStatusToWin32Error(res.nt_status)))) {
+                win32.WSAECONNREFUSED => error.ConnectionRefused,
+                win32.WSAEACCES => error.AccessDenied,
+                else => error.FileNotFound,
+            };
+        }
+    }
+    _ = win32.setsockopt(sock, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.UPDATE_CONNECT_CONTEXT, null, 0);
+    return handle;
+}
+
+pub fn netWriteFile(
+    self: *WindowsIo,
+    shard: anytype,
+    socket_handle: net.Socket.Handle,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+) net.Stream.Writer.WriteFileError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+    if (reader_buffered.len >= @backingInt(limit)) {
+        const op_res = try self.operate(shard, .{ .net_write = .{
+            .socket_handle = socket_handle,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.net_write;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (header.len != 0 or reader_buffered.len != 0) {
+                const op_res = try self.operate(shard, .{ .net_write = .{
+                    .socket_handle = socket_handle,
+                    .header = header,
+                    .data = &.{limit.slice(reader_buffered)},
+                    .splat = 1,
+                } });
+                const n = try op_res.net_write;
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return error.EndOfStream;
+        }
+    }
+    return error.Unimplemented;
 }
 
 pub fn netSocketCreatePair(

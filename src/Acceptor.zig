@@ -35,6 +35,9 @@ const NoopAcceptor = struct {
     pub fn bindShard(_: *NoopAcceptor, _: usize, _: ?*anyopaque, _: *const fn (?*anyopaque) void) void {}
     pub fn requestStop(_: *NoopAcceptor) void {}
     pub fn join(_: *NoopAcceptor) void {}
+    pub fn inboxCapacity(_: *const NoopAcceptor) u32 {
+        return 0;
+    }
     pub fn isSharedToken(_: *const NoopAcceptor, _: net.Socket.Handle) ?u32 {
         return null;
     }
@@ -92,6 +95,7 @@ const WindowsAcceptor = struct {
 
     gpa: Allocator,
     shard_count: usize,
+    inbox_capacity: u32,
     shards: []ShardTarget,
     tokens: []Token,
     listeners: []SharedListener,
@@ -113,6 +117,7 @@ const WindowsAcceptor = struct {
         inbox_capacity: u32,
     ) (Allocator.Error || Iocp.InitError || error{InvalidCapacity})!void {
         assert(shard_count > 0 and shard_count <= 64);
+        const cap = @max(@as(u32, 16), inbox_capacity);
 
         const shards = try gpa.alloc(ShardTarget, shard_count);
         errdefer gpa.free(shards);
@@ -122,7 +127,7 @@ const WindowsAcceptor = struct {
             for (shards[0..init_shards]) |*s| s.inbox.deinit(gpa, closeAcceptedSocket);
         }
         for (shards) |*s| {
-            s.* = .{ .inbox = try Mailbox(AcceptedSocket).init(gpa, @max(@as(u32, 16), inbox_capacity)) };
+            s.* = .{ .inbox = try Mailbox(AcceptedSocket).init(gpa, cap) };
             init_shards += 1;
         }
 
@@ -141,6 +146,7 @@ const WindowsAcceptor = struct {
         self.* = .{
             .gpa = gpa,
             .shard_count = shard_count,
+            .inbox_capacity = cap,
             .shards = shards,
             .tokens = tokens,
             .listeners = listeners,
@@ -363,8 +369,17 @@ const WindowsAcceptor = struct {
         return self.shards[shard_id].inbox.isEmptySeqCst();
     }
 
+    pub fn inboxCapacity(self: *const WindowsAcceptor) u32 {
+        return self.inbox_capacity;
+    }
+
     pub fn noteShardSocketAdopted(self: *WindowsAcceptor, shard_id: usize) void {
         _ = self.shards[shard_id].active_load.fetchSub(1, .monotonic);
+    }
+
+    pub fn noteShardSocketDropped(self: *WindowsAcceptor, shard_id: usize) void {
+        _ = self.shards[shard_id].active_load.fetchSub(1, .monotonic);
+        _ = self.refused_count.fetchAdd(1, .monotonic);
     }
 
     pub fn requestStop(self: *WindowsAcceptor) void {
@@ -508,6 +523,7 @@ const WindowsAcceptor = struct {
                         };
                         chosen_shard = sid;
                     } else {
+                        _ = self.refused_count.fetchAdd(1, .monotonic);
                         raw_to_close = raw_sock;
                     }
                 } else {
@@ -557,6 +573,7 @@ const WindowsAcceptor = struct {
             const bit = @as(u64, 1) << @intCast(sid);
             if ((l.subscribed_mask & bit) == 0) continue;
             const load = self.shards[sid].active_load.load(.monotonic);
+            if (load >= self.inbox_capacity) continue;
             if (load < best_load) {
                 best_load = load;
                 best_shard = sid;

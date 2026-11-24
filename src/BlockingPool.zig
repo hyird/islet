@@ -1,17 +1,21 @@
 //! Bounded worker thread pool for synchronous/blocking syscall offload.
 //!
-//! Design invariants (AGENTS.md §3, §4):
-//! - Pre-sized worker threads and bounded admission (`max_queued`); returns
-//!   explicit `.queue_full` or `.closed` backpressure status on rejection.
+//! Design invariants (AGENTS.md §3, §4, §5):
+//! - Pre-sized worker threads and bounded admission (`queue_capacity` + bounded
+//!   `wait_capacity` intrusive waiter queue); `submit` returns explicit
+//!   `.queue_full` / `.closed` immediately for `Io.Batch.awaitConcurrent`, while
+//!   `submitWaitable` parks Fiber-resident `Job` nodes in FIFO admission order and
+//!   promotes them directly on worker pop/cancel with **zero 1ms polling sleep**
+//!   and **zero extra cross-thread wakeup round-trips**.
 //! - Zero heap allocation per submitted job: intrusive `Job` nodes live on the
 //!   calling Fiber's stack frame.
-//! - Safe cancellation (`tryCancel` / `runBlockingJoined`):
-//!   - If still queued, unlinks `Job` in O(1) under the mutex so worker threads
-//!     never touch the stack frame (`canceled_queued`).
+//! - Safe cancellation (`tryCancel`):
+//!   - If `.waiting_admission` or `.queued`, unlinks `Job` in O(1) under the mutex
+//!     (promoting the next admission waiter when freeing a queue slot) so worker
+//!     threads never touch the stack frame (`canceled_queued`).
 //!   - If already popped and running on a worker thread, returns `.must_await`
 //!     so the calling Fiber waits uncancelably until completion before unwinding.
-//! - Owns a single shared `std.Io.Threaded` initialized via `.init_single_threaded`
-//!   (no global signal handlers, zero extra threads, serialized `processSpawn`).
+//! - Owns a single shared `std.Io.Threaded` initialized via `.init_single_threaded`.
 //! - Self-submission or self-`join` from inside a pool worker triggers `@panic`.
 
 const std = @import("std");
@@ -42,6 +46,7 @@ pub const CancelOutcome = enum {
 
 pub const JobState = enum(u8) {
     idle,
+    waiting_admission,
     queued,
     running,
     canceled,
@@ -73,6 +78,10 @@ head: ?*Job = null,
 tail: ?*Job = null,
 queued_count: usize = 0,
 queue_capacity: usize,
+wait_head: ?*Job = null,
+wait_tail: ?*Job = null,
+waiting_count: usize = 0,
+wait_capacity: usize,
 stopping: bool = false,
 joined: bool = false,
 
@@ -107,6 +116,7 @@ pub fn init(
         .threaded = threaded,
         .threads = threads,
         .queue_capacity = queue_capacity,
+        .wait_capacity = @max(@as(usize, 64), queue_capacity *| 8),
     };
     errdefer self.threaded.deinit();
 
@@ -157,67 +167,131 @@ pub fn join(self: *BlockingPool) void {
     for (self.threads) |t| t.join();
 }
 
-/// Submits an address-stable `Job`. Never blocks; executes callbacks and wakeup
-/// notifications strictly outside `self.mutex`.
+/// Non-blocking bounded submission (`Io.Batch.awaitConcurrent`): rejects immediately
+/// with `.queue_full` when `queued_count >= queue_capacity`.
 pub fn submit(self: *BlockingPool, job: *Job) SubmitStatus {
+    return self.submitInternal(job, false);
+}
+
+/// Event-driven Fiber submission (`Shard.callBlocking`): if the active worker queue
+/// is full, links `job` into the bounded FIFO admission waiter list so a worker
+/// promotes and runs `job` directly in O(1) as soon as a slot opens, avoiding
+/// polling timer sleeps.
+pub fn submitWaitable(self: *BlockingPool, job: *Job) SubmitStatus {
+    return self.submitInternal(job, true);
+}
+
+fn submitInternal(self: *BlockingPool, job: *Job, allow_wait: bool) SubmitStatus {
     if (tls_current_pool == self) {
         @panic("islet.BlockingPool.submit: self-submission from pool worker thread");
     }
     assert(job.state == .idle);
     const kio = kernelIo();
 
+    var should_signal = false;
     {
         self.mutex.lockUncancelable(kio);
         if (self.stopping) {
             self.mutex.unlock(kio);
             return .closed;
         }
-        if (self.queued_count >= self.queue_capacity) {
+        if (self.queued_count < self.queue_capacity) {
+            assert(self.waiting_count == 0);
+            self.pushQueuedLocked(job);
+            should_signal = true;
+            self.mutex.unlock(kio);
+        } else if (allow_wait and self.waiting_count < self.wait_capacity) {
+            self.pushWaiterLocked(job);
+            self.mutex.unlock(kio);
+        } else {
             self.mutex.unlock(kio);
             return .queue_full;
         }
-        job.prev = self.tail;
-        job.next = null;
-        job.state = .queued;
-        if (self.tail) |t| {
-            t.next = job;
-        } else {
-            self.head = job;
-        }
-        self.tail = job;
-        self.queued_count += 1;
-        self.mutex.unlock(kio);
     }
-    self.cond.signal(kio);
+    if (should_signal) {
+        self.cond.signal(kio);
+    }
     return .accepted;
 }
 
-/// Attempts to withdraw a queued `Job` in O(1).
+fn pushQueuedLocked(self: *BlockingPool, job: *Job) void {
+    job.prev = self.tail;
+    job.next = null;
+    job.state = .queued;
+    if (self.tail) |t| {
+        t.next = job;
+    } else {
+        self.head = job;
+    }
+    self.tail = job;
+    self.queued_count += 1;
+}
+
+fn pushWaiterLocked(self: *BlockingPool, job: *Job) void {
+    job.prev = self.wait_tail;
+    job.next = null;
+    job.state = .waiting_admission;
+    if (self.wait_tail) |t| {
+        t.next = job;
+    } else {
+        self.wait_head = job;
+    }
+    self.wait_tail = job;
+    self.waiting_count += 1;
+}
+
+fn promoteOneWaiterLocked(self: *BlockingPool) bool {
+    if (self.queued_count >= self.queue_capacity) return false;
+    const w = self.wait_head orelse return false;
+    self.wait_head = w.next;
+    if (self.wait_head) |nh| {
+        nh.prev = null;
+    } else {
+        self.wait_tail = null;
+    }
+    assert(w.state == .waiting_admission);
+    self.waiting_count -= 1;
+    self.pushQueuedLocked(w);
+    return true;
+}
+
+/// Attempts to withdraw a queued or admission-waiting `Job` in O(1).
 /// - `.canceled_queued`: unlinked before any worker touched it; caller owns `job` immediately.
 /// - `.must_await`: already running/completed; caller MUST await `resume_node` before unwinding!
 pub fn tryCancel(self: *BlockingPool, job: *Job) CancelOutcome {
     const kio = kernelIo();
-    self.mutex.lockUncancelable(kio);
-    defer self.mutex.unlock(kio);
+    var promoted = false;
+    const outcome: CancelOutcome = blk: {
+        self.mutex.lockUncancelable(kio);
+        defer self.mutex.unlock(kio);
 
-    if (job.state == .queued) {
-        if (job.prev) |p| {
-            p.next = job.next;
-        } else {
-            self.head = job.next;
+        switch (job.state) {
+            .queued => {
+                if (job.prev) |p| p.next = job.next else self.head = job.next;
+                if (job.next) |n| n.prev = job.prev else self.tail = job.prev;
+                job.prev = null;
+                job.next = null;
+                job.state = .canceled;
+                self.queued_count -= 1;
+                promoted = self.promoteOneWaiterLocked();
+                break :blk .canceled_queued;
+            },
+            .waiting_admission => {
+                if (job.prev) |p| p.next = job.next else self.wait_head = job.next;
+                if (job.next) |n| n.prev = job.prev else self.wait_tail = job.prev;
+                job.prev = null;
+                job.next = null;
+                job.state = .canceled;
+                self.waiting_count -= 1;
+                break :blk .canceled_queued;
+            },
+            else => break :blk .must_await,
         }
-        if (job.next) |n| {
-            n.prev = job.prev;
-        } else {
-            self.tail = job.prev;
-        }
-        job.prev = null;
-        job.next = null;
-        job.state = .canceled;
-        self.queued_count -= 1;
-        return .canceled_queued;
+    };
+    if (promoted) {
+        self.cond.signal(kio);
     }
-    return .must_await;
+    return outcome;
 }
 
 fn workerLoop(self: *BlockingPool) void {
@@ -243,10 +317,12 @@ fn workerLoop(self: *BlockingPool) void {
                 assert(h.state == .queued);
                 h.state = .running;
                 self.queued_count -= 1;
+                _ = self.promoteOneWaiterLocked();
                 self.mutex.unlock(kio);
                 break :blk h;
             }
             assert(self.stopping);
+            assert(self.wait_head == null);
             self.mutex.unlock(kio);
             return;
         };
@@ -267,7 +343,7 @@ fn workerLoop(self: *BlockingPool) void {
     }
 }
 
-test "BlockingPool executes jobs, enforces backpressure, and cancels queued work safely" {
+test "BlockingPool executes jobs, enforces backpressure, promotes waitable admission, and cancels safely" {
     const gpa = std.testing.allocator;
     const kio = kernelIo();
     var pool: BlockingPool = undefined;
@@ -333,6 +409,13 @@ test "BlockingPool executes jobs, enforces backpressure, and cancels queued work
         .notify_ctx = &door_rings,
         .notify_fn = Work.ring,
     } };
+    var w5: Work = .{ .job = .{
+        .run_fn = Work.exec,
+        .resume_lane = &lane,
+        .resume_node = .{ .callback = Work.onResume },
+        .notify_ctx = &door_rings,
+        .notify_fn = Work.ring,
+    } };
 
     // Hold the single worker busy with w1, then fill queue with w2 and w3.
     try std.testing.expectEqual(SubmitStatus.accepted, pool.submit(&w1.job));
@@ -340,17 +423,24 @@ test "BlockingPool executes jobs, enforces backpressure, and cancels queued work
 
     try std.testing.expectEqual(SubmitStatus.accepted, pool.submit(&w2.job));
     try std.testing.expectEqual(SubmitStatus.accepted, pool.submit(&w3.job));
+    // Non-waitable `submit` immediately rejects with `.queue_full`.
     try std.testing.expectEqual(SubmitStatus.queue_full, pool.submit(&w4.job));
+    // Waitable `submitWaitable` admits w4 and w5 into `waiting_admission`!
+    try std.testing.expectEqual(SubmitStatus.accepted, pool.submitWaitable(&w4.job));
+    try std.testing.expectEqual(SubmitStatus.accepted, pool.submitWaitable(&w5.job));
 
-    // Cancel w2 while queued: must unlink immediately and free up 1 queue slot!
+    // Cancel w5 while still in `waiting_admission`:
+    try std.testing.expectEqual(CancelOutcome.canceled_queued, pool.tryCancel(&w5.job));
+    // Cancel w2 while `.queued`: must promote w4 directly into `.queued`!
     try std.testing.expectEqual(CancelOutcome.canceled_queued, pool.tryCancel(&w2.job));
+    try std.testing.expectEqual(JobState.queued, w4.job.state);
     // w1 is running: must report `.must_await`.
     try std.testing.expectEqual(CancelOutcome.must_await, pool.tryCancel(&w1.job));
 
     gate.set(kio);
-    while (door_rings.load(.seq_cst) < 2) {
+    while (door_rings.load(.seq_cst) < 3) {
         std.Thread.yield() catch {};
     }
-    try std.testing.expectEqual(@as(usize, 2), lane.drain());
-    try std.testing.expect(w1.ran and !w2.ran and w3.ran);
+    try std.testing.expectEqual(@as(usize, 3), lane.drain());
+    try std.testing.expect(w1.ran and !w2.ran and w3.ran and w4.ran and !w5.ran);
 }

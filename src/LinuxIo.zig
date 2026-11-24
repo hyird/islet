@@ -306,6 +306,254 @@ pub fn dirClose(self: *LinuxIo, _: anytype, dirs: []const Dir) void {
     }
 }
 
+fn mapSendErrorToNetSend(err: linux.E) net.Socket.SendError {
+    return switch (err) {
+        .MSGSIZE => error.MessageOversize,
+        .NOMEM, .NOBUFS => error.SystemResources,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETDOWN => error.NetworkDown,
+        .CONNREFUSED => error.ConnectionRefused,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .PIPE, .NOTCONN => error.SocketUnconnected,
+        .ACCES => error.AccessDenied,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        else => posix.unexpectedErrno(err),
+    };
+}
+
+const CopyRangeArgs = struct {
+    in_fd: linux.fd_t,
+    has_in_off: bool,
+    in_off: linux.off_t,
+    out_fd: linux.fd_t,
+    has_out_off: bool,
+    out_off: linux.off_t,
+    len: usize,
+};
+
+fn execCopyFileRange(_: *Threaded, args: CopyRangeArgs) File.WriteFilePositionalError!usize {
+    var in_off = args.in_off;
+    var out_off = args.out_off;
+    while (true) {
+        const rc = linux.copy_file_range(
+            args.in_fd,
+            if (args.has_in_off) &in_off else null,
+            args.out_fd,
+            if (args.has_out_off) &out_off else null,
+            args.len,
+            0,
+        );
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            .OPNOTSUPP, .INVAL, .NOSYS, .XDEV, .BADF, .ISDIR => return error.Unimplemented,
+            .SPIPE, .NXIO => return error.Unseekable,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .NOMEM => return error.SystemResources,
+            .NOSPC => return error.NoSpaceLeft,
+            .PERM => return error.PermissionDenied,
+            .BUSY => return error.DeviceBusy,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+pub fn fileWriteFileStreaming(
+    self: *LinuxIo,
+    shard: anytype,
+    file: File,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+) File.Writer.WriteFileError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+
+    if (reader_buffered.len >= @backingInt(limit)) {
+        const op_res = try self.operate(shard, .{ .file_write_streaming = .{
+            .file = file,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.file_write_streaming;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (header.len != 0 or reader_buffered.len != 0) {
+                const op_res = try self.operate(shard, .{ .file_write_streaming = .{
+                    .file = file,
+                    .header = header,
+                    .data = &.{limit.slice(reader_buffered)},
+                    .splat = 1,
+                } });
+                const n = try op_res.file_write_streaming;
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return error.EndOfStream;
+        }
+    }
+
+    if (header.len != 0 or reader_buffered.len != 0) {
+        const op_res = try self.operate(shard, .{ .file_write_streaming = .{
+            .file = file,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.file_write_streaming;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    const max_count: usize = 0x7ffff000;
+    var in_off: linux.off_t = 0;
+    const has_in_off: bool, const count: usize = switch (file_reader.mode) {
+        .positional => blk: {
+            const size = file_reader.getSize() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unimplemented,
+            };
+            if (size <= file_reader.pos) {
+                file_reader.size = file_reader.pos;
+                return error.EndOfStream;
+            }
+            in_off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
+            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
+        },
+        .streaming => .{ false, @min(@backingInt(limit), max_count) },
+        .positional_simple, .streaming_simple => return error.Unimplemented,
+        .failure => return error.ReadFailed,
+    };
+    if (count == 0) return 0;
+
+    if (file.flags.nonblocking) {
+        while (true) {
+            const rc = linux.sendfile(file.handle, file_reader.file.handle, if (has_in_off) &in_off else null, count);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    self.poller.cascadeNext(file.handle, .write);
+                    if (rc == 0) {
+                        file_reader.size = file_reader.pos;
+                        return error.EndOfStream;
+                    }
+                    file_reader.pos += rc;
+                    return rc;
+                },
+                .INTR => continue,
+                .AGAIN => {
+                    self.waitFd(shard, file.handle, .write, null) catch |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                        error.OutOfMemory, error.SystemResources => return error.SystemResources,
+                        else => return error.Unexpected,
+                    };
+                },
+                .INVAL, .NOSYS, .OPNOTSUPP, .SPIPE, .NXIO => return error.Unimplemented,
+                .PIPE, .NOTCONN => return error.BrokenPipe,
+                .IO => return error.InputOutput,
+                .NOMEM, .NOBUFS => return error.SystemResources,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
+    }
+
+    const copied = shard.callBlocking(true, execCopyFileRange, .{CopyRangeArgs{
+        .in_fd = file_reader.file.handle,
+        .has_in_off = has_in_off,
+        .in_off = in_off,
+        .out_fd = file.handle,
+        .has_out_off = false,
+        .out_off = 0,
+        .len = count,
+    }}) catch |err| switch (err) {
+        error.Unseekable => return error.Unimplemented,
+        else => |e| return e,
+    };
+    if (copied == 0) {
+        file_reader.size = file_reader.pos;
+        return error.EndOfStream;
+    }
+    file_reader.pos += copied;
+    return copied;
+}
+
+pub fn fileWriteFilePositional(
+    _: *LinuxIo,
+    shard: anytype,
+    file: File,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+    offset: u64,
+) File.WriteFilePositionalError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+    const shard_io = shard.io();
+
+    if (header.len != 0 or reader_buffered.len != 0) {
+        const n = try shard_io.vtable.fileWritePositional(
+            shard_io.userdata,
+            file,
+            header,
+            &.{limit.slice(reader_buffered)},
+            1,
+            offset,
+        );
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) return error.EndOfStream;
+    }
+
+    const out_off = std.math.cast(linux.off_t, offset) orelse return error.Unseekable;
+    const max_count: usize = 0x7ffff000;
+    var in_off: linux.off_t = 0;
+    const has_in_off: bool, const count: usize = switch (file_reader.mode) {
+        .positional => blk: {
+            const size = file_reader.getSize() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unimplemented,
+            };
+            if (size <= file_reader.pos) {
+                file_reader.size = file_reader.pos;
+                return error.EndOfStream;
+            }
+            in_off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
+            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
+        },
+        .streaming => .{ false, @min(@backingInt(limit), max_count) },
+        .positional_simple, .streaming_simple => return error.Unimplemented,
+        .failure => return error.ReadFailed,
+    };
+    if (count == 0) return 0;
+
+    const copied = try shard.callBlocking(true, execCopyFileRange, .{CopyRangeArgs{
+        .in_fd = file_reader.file.handle,
+        .has_in_off = has_in_off,
+        .in_off = in_off,
+        .out_fd = file.handle,
+        .has_out_off = true,
+        .out_off = out_off,
+        .len = count,
+    }});
+    if (copied == 0) {
+        file_reader.size = file_reader.pos;
+        return error.EndOfStream;
+    }
+    file_reader.pos += copied;
+    return copied;
+}
+
 pub fn processSpawn(_: *LinuxIo, shard: anytype, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
     var sanitized = options;
     sanitized.progress_node = .none;
@@ -654,9 +902,9 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
             if (o.flags.oob) send_flags |= linux.MSG.OOB;
             if (o.flags.fastopen) send_flags |= linux.MSG.FASTOPEN;
 
-            var sent_msgs: usize = 0;
-            while (sent_msgs < o.messages.len) {
-                const msg_item = &o.messages[sent_msgs];
+            // Single-message fast path: direct `sendmsg` without `mmsghdr` array setup.
+            if (o.messages.len == 1) {
+                const msg_item = &o.messages[0];
                 var dest: Threaded.PosixAddress = undefined;
                 const dest_len = Threaded.addressToPosix(msg_item.address, &dest);
                 var iov: [1]posix.iovec_const = .{.{ .base = msg_item.data_ptr, .len = msg_item.data_len }};
@@ -669,35 +917,67 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
                     .controllen = @intCast(msg_item.control.len),
                     .flags = 0,
                 };
-                const rc = linux.sendmsg(o.socket_handle, &hdr, send_flags);
-                switch (linux.errno(rc)) {
-                    .SUCCESS => {
-                        msg_item.data_len = rc;
-                        sent_msgs += 1;
-                    },
-                    .INTR => continue,
-                    .AGAIN => {
-                        if (sent_msgs > 0) return .{ .done = .{ .net_send = .{ null, sent_msgs } } };
-                        return .{ .would_block = .{ .fd = o.socket_handle, .dir = .write } };
-                    },
-                    else => |err| {
-                        const mapped: net.Socket.SendError = switch (err) {
-                            .MSGSIZE => error.MessageOversize,
-                            .NOMEM, .NOBUFS => error.SystemResources,
-                            .NETUNREACH => error.NetworkUnreachable,
-                            .HOSTUNREACH => error.HostUnreachable,
-                            .NETDOWN => error.NetworkDown,
-                            .CONNREFUSED => error.ConnectionRefused,
-                            .AFNOSUPPORT => error.AddressFamilyUnsupported,
-                            .ALREADY => error.FastOpenAlreadyInProgress,
-                            .CONNRESET => error.ConnectionResetByPeer,
-                            .PIPE, .NOTCONN => error.SocketUnconnected,
-                            .ACCES => error.AccessDenied,
-                            .TIMEDOUT => error.ConnectionTimedOut,
-                            else => posix.unexpectedErrno(err),
-                        };
-                        return .{ .done = .{ .net_send = .{ mapped, sent_msgs } } };
-                    },
+                while (true) {
+                    const rc = linux.sendmsg(o.socket_handle, &hdr, send_flags);
+                    switch (linux.errno(rc)) {
+                        .SUCCESS => {
+                            msg_item.data_len = rc;
+                            return .{ .done = .{ .net_send = .{ null, 1 } } };
+                        },
+                        .INTR => continue,
+                        .AGAIN => return .{ .would_block = .{ .fd = o.socket_handle, .dir = .write } },
+                        else => |err| return .{ .done = .{ .net_send = .{ mapSendErrorToNetSend(err), 0 } } },
+                    }
+                }
+            }
+
+            // Multi-datagram fast path: batch up to 16 datagrams per `sendmmsg(2)` syscall.
+            const max_mmsg = 16;
+            var sent_msgs: usize = 0;
+            while (sent_msgs < o.messages.len) {
+                const batch_n = @min(max_mmsg, o.messages.len - sent_msgs);
+                var addrs: [max_mmsg]Threaded.PosixAddress = undefined;
+                var iovs: [max_mmsg][1]posix.iovec = undefined;
+                var mhdrs: [max_mmsg]linux.mmsghdr = undefined;
+
+                for (0..batch_n) |k| {
+                    const msg_item = &o.messages[sent_msgs + k];
+                    const dest_len = Threaded.addressToPosix(msg_item.address, &addrs[k]);
+                    iovs[k][0] = .{ .base = @constCast(msg_item.data_ptr), .len = msg_item.data_len };
+                    mhdrs[k] = .{
+                        .hdr = .{
+                            .name = @ptrCast(&addrs[k].any),
+                            .namelen = dest_len,
+                            .iov = &iovs[k],
+                            .iovlen = 1,
+                            .control = if (msg_item.control.len > 0) @constCast(msg_item.control.ptr) else null,
+                            .controllen = @intCast(msg_item.control.len),
+                            .flags = 0,
+                        },
+                        .len = 0,
+                    };
+                }
+
+                while (true) {
+                    const rc = linux.sendmmsg(o.socket_handle, &mhdrs, @intCast(batch_n), send_flags);
+                    switch (linux.errno(rc)) {
+                        .SUCCESS => {
+                            for (0..rc) |k| {
+                                o.messages[sent_msgs + k].data_len = mhdrs[k].len;
+                            }
+                            sent_msgs += rc;
+                            if (rc < batch_n) {
+                                return .{ .done = .{ .net_send = .{ null, sent_msgs } } };
+                            }
+                            break;
+                        },
+                        .INTR => continue,
+                        .AGAIN => {
+                            if (sent_msgs > 0) return .{ .done = .{ .net_send = .{ null, sent_msgs } } };
+                            return .{ .would_block = .{ .fd = o.socket_handle, .dir = .write } };
+                        },
+                        else => |err| return .{ .done = .{ .net_send = .{ mapSendErrorToNetSend(err), sent_msgs } } },
+                    }
                 }
             }
             return .{ .done = .{ .net_send = .{ null, sent_msgs } } };
@@ -1553,6 +1833,26 @@ pub fn netListenUnix(
     return fd;
 }
 
+fn mapUnixConnectErr(err: linux.E) net.UnixAddress.ConnectError {
+    return switch (err) {
+        .CONNREFUSED => error.ConnectionRefused,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .LOOP => error.SymLinkLoop,
+        .ROFS => error.ReadOnlyFileSystem,
+        .AGAIN => error.WouldBlock,
+        .NETDOWN => error.NetworkDown,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .PROTOTYPE => error.SocketModeUnsupported,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM, .NOBUFS => error.SystemResources,
+        else => posix.unexpectedErrno(err),
+    };
+}
+
 pub fn netConnectUnix(
     self: *LinuxIo,
     shard: anytype,
@@ -1561,12 +1861,7 @@ pub fn netConnectUnix(
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     const fd: linux.fd_t = switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        else => |err| return posix.unexpectedErrno(err),
+        else => |err| return mapUnixConnectErr(err),
     };
     errdefer {
         self.poller.unregisterFd(fd);
@@ -1583,27 +1878,18 @@ pub fn netConnectUnix(
             .AGAIN, .INPROGRESS => {
                 self.waitFd(shard, fd, .write, null) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
+                    error.OutOfMemory, error.SystemResources => return error.SystemResources,
+                    error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
                     else => return error.Unexpected,
                 };
                 var so_err: c_int = 0;
                 var opt_len: posix.socklen_t = @sizeOf(c_int);
-                _ = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&so_err), &opt_len);
+                const grc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&so_err), &opt_len);
+                if (linux.errno(grc) != .SUCCESS) return error.Unexpected;
                 if (so_err == 0) return fd;
-                switch (@as(linux.E, @fromBackingInt(@intCast(so_err)))) {
-                    .CONNREFUSED => return error.ConnectionRefused,
-                    .NOENT => return error.FileNotFound,
-                    .ACCES => return error.AccessDenied,
-                    else => return error.Unexpected,
-                }
+                return mapUnixConnectErr(@fromBackingInt(@intCast(so_err)));
             },
-            .CONNREFUSED => return error.ConnectionRefused,
-            .NOENT => return error.FileNotFound,
-            .NOTDIR => return error.NotDir,
-            .ACCES => return error.AccessDenied,
-            .PERM => return error.PermissionDenied,
-            .LOOP => return error.SymLinkLoop,
-            .ROFS => return error.ReadOnlyFileSystem,
-            else => |err| return posix.unexpectedErrno(err),
+            else => |err| return mapUnixConnectErr(err),
         }
     }
 }
@@ -1632,6 +1918,111 @@ pub fn netSocketCreatePair(
         .NOMEM, .NOBUFS => return error.SystemResources,
         .ACCES => return error.AccessDenied,
         else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+pub fn netWriteFile(
+    self: *LinuxIo,
+    shard: anytype,
+    socket_handle: net.Socket.Handle,
+    header: []const u8,
+    file_reader: *File.Reader,
+    limit: Io.Limit,
+) net.Stream.Writer.WriteFileError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const reader_buffered = file_reader.interface.buffered();
+
+    if (reader_buffered.len >= @backingInt(limit)) {
+        const op_res = try self.operate(shard, .{ .net_write = .{
+            .socket_handle = socket_handle,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.net_write;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) {
+            if (header.len != 0 or reader_buffered.len != 0) {
+                const op_res = try self.operate(shard, .{ .net_write = .{
+                    .socket_handle = socket_handle,
+                    .header = header,
+                    .data = &.{limit.slice(reader_buffered)},
+                    .splat = 1,
+                } });
+                const n = try op_res.net_write;
+                file_reader.interface.toss(n -| header.len);
+                return n;
+            }
+            return error.EndOfStream;
+        }
+    }
+
+    if (header.len != 0 or reader_buffered.len != 0) {
+        const op_res = try self.operate(shard, .{ .net_write = .{
+            .socket_handle = socket_handle,
+            .header = header,
+            .data = &.{limit.slice(reader_buffered)},
+            .splat = 1,
+        } });
+        const n = try op_res.net_write;
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+
+    const max_count: usize = 0x7ffff000;
+    var off: linux.off_t = 0;
+    const use_offset: bool, const count: usize = switch (file_reader.mode) {
+        .positional => blk: {
+            const size = file_reader.getSize() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unimplemented,
+            };
+            if (size <= file_reader.pos) {
+                file_reader.size = file_reader.pos;
+                return error.EndOfStream;
+            }
+            off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
+            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
+        },
+        .streaming => .{ false, @min(@backingInt(limit), max_count) },
+        .positional_simple, .streaming_simple => return error.Unimplemented,
+        .failure => return error.ReadFailed,
+    };
+    if (count == 0) return 0;
+
+    while (true) {
+        const rc = linux.sendfile(socket_handle, file_reader.file.handle, if (use_offset) &off else null, count);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                self.poller.cascadeNext(socket_handle, .write);
+                if (rc == 0) {
+                    file_reader.size = file_reader.pos;
+                    return error.EndOfStream;
+                }
+                file_reader.pos += rc;
+                return rc;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                self.waitFd(shard, socket_handle, .write, null) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.OutOfMemory, error.SystemResources => return error.SystemResources,
+                    else => return error.Unexpected,
+                };
+            },
+            .INVAL, .NOSYS, .OPNOTSUPP, .SPIPE, .NXIO => return error.Unimplemented,
+            .PIPE, .NOTCONN => return error.SocketUnconnected,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NETDOWN => return error.NetworkDown,
+            .IO => return error.ReadFailed,
+            .NOMEM, .NOBUFS => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 }
 

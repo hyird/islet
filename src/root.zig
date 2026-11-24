@@ -711,3 +711,233 @@ test "Refactor regressions: zero-heap steady-state Io.Batch and LIFO ping-pong a
     try grp.await(io);
     try std.testing.expectEqual(@as(usize, 1), pp.fifo_progress);
 }
+
+test "Round 2 E2E: nested Future.await cancel propagation, reentrant stderr, zero-copy sendfile/copy_file_range, and batched sendmmsg" {
+    const gpa = std.testing.allocator;
+    var shard: Shard = undefined;
+    try shard.init(gpa, .{
+        .blocking_threads = 1,
+        .blocking_queue_capacity = 2,
+    });
+    defer shard.deinit();
+    const io = shard.io();
+
+    // 1. Nested `Future.await` parent->child cancellation propagation (no deadlock + single-ack contract):
+    {
+        const Nested = struct {
+            inner_started: Io.Event = .unset,
+            never_event: Io.Event = .unset,
+            outer_saw_extra_cancel: bool = false,
+
+            fn innerTask(task_io: Io, st: *@This()) Io.Cancelable!u32 {
+                st.inner_started.set(task_io);
+                try st.never_event.wait(task_io);
+                return 7;
+            }
+
+            fn outerTask(task_io: Io, st: *@This()) !u32 {
+                var child = try task_io.concurrent(innerTask, .{ task_io, st });
+                const child_res = child.await(task_io);
+                // Because `innerTask` consumed the propagated cancel, `outerTask` must NOT
+                // observe a duplicate second `error.Canceled` at its own checkCancel!
+                task_io.checkCancel() catch {
+                    st.outer_saw_extra_cancel = true;
+                };
+                return child_res;
+            }
+        };
+
+        var nst: Nested = .{};
+        var outer = try io.concurrent(Nested.outerTask, .{ io, &nst });
+        try nst.inner_started.wait(io);
+        try std.testing.expectError(error.Canceled, outer.cancel(io));
+        try std.testing.expect(!nst.outer_saw_extra_cancel);
+
+        // Conversely, if `child` finished WITHOUT consuming cancel, `parent` MUST retain its cancel:
+        const Unconsumed = struct {
+            gate: Io.Event = .unset,
+            ready: Io.Event = .unset,
+
+            fn fastChild(_: Io) u32 {
+                return 42;
+            }
+
+            fn parentTask(task_io: Io, st: *@This()) !u32 {
+                var child = try task_io.concurrent(fastChild, .{task_io});
+                // Let `fastChild` finish before `parentTask` is canceled, then test `await` while canceled:
+                try task_io.sleep(.fromMilliseconds(1), .awake);
+                st.ready.set(task_io);
+                // Wait in `.blocked` until outer sets cancel, then restore `.unblocked` and call `child.await`:
+                {
+                    const prev = task_io.swapCancelProtection(.blocked);
+                    defer _ = task_io.swapCancelProtection(prev);
+                    st.gate.waitUncancelable(task_io);
+                }
+                const v = child.await(task_io);
+                try std.testing.expectEqual(@as(u32, 42), v);
+                // Cancel was NOT consumed by `fastChild`, so `checkCancel` MUST fire here!
+                try task_io.checkCancel();
+                return v;
+            }
+        };
+        var ust: Unconsumed = .{};
+        var p_fut = try io.concurrent(Unconsumed.parentTask, .{ io, &ust });
+        try ust.ready.wait(io);
+        // Request cancel on `p_fut`: first wake `gate` inside `cancel`? Set `gate` right after queueing wake!
+        var releaser = try io.concurrent(struct {
+            fn run(t_io: Io, g: *Io.Event) void {
+                t_io.sleep(.fromMilliseconds(1), .awake) catch {};
+                g.set(t_io);
+            }
+        }.run, .{ io, &ust.gate });
+        defer _ = releaser.await(io);
+        try std.testing.expectError(error.Canceled, p_fut.cancel(io));
+    }
+
+    // 2. Reentrant `lockStderr` + `tryLockStderr` + `unlockStderr` buffer hygiene:
+    {
+        var outer_buf: [64]u8 = undefined;
+        var inner_buf: [32]u8 = undefined;
+        const ls1 = try io.lockStderr(&outer_buf, null);
+        try std.testing.expectEqual(@as(usize, 64), ls1.file_writer.interface.buffer.len);
+        {
+            const ls2 = (try io.tryLockStderr(&inner_buf, .no_color)).?;
+            try std.testing.expectEqual(Io.Terminal.Mode.no_color, ls2.terminal_mode);
+            try std.testing.expectEqual(@as(usize, 32), ls2.file_writer.interface.buffer.len);
+            io.unlockStderr();
+            // Inner `unlockStderr` must clear dangling `inner_buf` slice immediately!
+            try std.testing.expectEqual(@as(usize, 0), ls1.file_writer.interface.buffer.len);
+        }
+        io.unlockStderr();
+        try std.testing.expectEqual(@as(usize, 0), shard.stderr_writer.interface.buffer.len);
+    }
+
+    // 3. Batched `sendmmsg` multi-datagram UDP + zero-copy `sendfile` / `copy_file_range`:
+    {
+        const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const rx = try lo.bind(io, .{ .mode = .dgram });
+        defer rx.close(io);
+        const tx = try lo.bind(io, .{ .mode = .dgram });
+        defer tx.close(io);
+
+        var payloads: [20][4]u8 = undefined;
+        var out_msgs: [20]Io.net.OutgoingMessage = undefined;
+        for (0..20) |i| {
+            payloads[i] = .{ 'P', 'K', @intCast('0' + (i / 10)), @intCast('0' + (i % 10)) };
+            out_msgs[i] = .{
+                .address = &rx.address,
+                .data_ptr = &payloads[i],
+                .data_len = payloads[i].len,
+            };
+        }
+        try tx.sendMany(io, &out_msgs, .{});
+
+        var in_msgs: [20]Io.net.IncomingMessage = @splat(.init);
+        var rx_buf: [256]u8 = undefined;
+        var total_rx: usize = 0;
+        while (total_rx < 20) {
+            const err_opt, const n = rx.receiveManyTimeout(
+                io,
+                in_msgs[total_rx..],
+                &rx_buf,
+                .{},
+                .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
+            );
+            try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, null), err_opt);
+            total_rx += n;
+        }
+        try std.testing.expectEqual(@as(usize, 20), total_rx);
+
+        // Real-kernel zero-copy file -> file (`copy_file_range`) and file -> TCP socket (`sendfile`):
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(io, ".zig-cache/islet-zc-test");
+        defer cwd.deleteDir(io, ".zig-cache/islet-zc-test") catch {};
+
+        const src_path = ".zig-cache/islet-zc-test/src.bin";
+        const dst_path = ".zig-cache/islet-zc-test/dst.bin";
+        defer cwd.deleteFile(io, src_path) catch {};
+        defer cwd.deleteFile(io, dst_path) catch {};
+
+        const pattern_len = 4096;
+        var pattern: [pattern_len]u8 = undefined;
+        for (&pattern, 0..) |*b, idx| b.* = @truncate(idx *% 37 +% 11);
+
+        {
+            const f = try cwd.createFile(io, src_path, .{ .truncate = true });
+            defer f.close(io);
+            var wbuf: [512]u8 = undefined;
+            var fw = f.writer(io, &wbuf);
+            try fw.interface.writeAll(&pattern);
+            try fw.interface.flush();
+        }
+
+        // File -> File zero-copy via `File.Writer.interface.sendFileAll`:
+        {
+            const src_f = try cwd.openFile(io, src_path, .{});
+            defer src_f.close(io);
+            const dst_f = try cwd.createFile(io, dst_path, .{ .truncate = true, .read = true });
+            defer dst_f.close(io);
+
+            var rbuf: [256]u8 = undefined;
+            var fr = src_f.reader(io, &rbuf);
+            var wbuf: [256]u8 = undefined;
+            var fw = dst_f.writer(io, &wbuf);
+            try fw.interface.writeAll("HDR:");
+            const sent_f = try fw.interface.sendFileAll(&fr, .unlimited);
+            try fw.interface.flush();
+            try std.testing.expectEqual(pattern_len, sent_f);
+
+            var verify_buf: [4 + pattern_len]u8 = undefined;
+            const n_read = try dst_f.readPositionalAll(io, &verify_buf, 0);
+            try std.testing.expectEqual(verify_buf.len, n_read);
+            try std.testing.expectEqualStrings("HDR:", verify_buf[0..4]);
+            try std.testing.expectEqualSlices(u8, &pattern, verify_buf[4..]);
+        }
+
+        // File -> TCP Socket zero-copy (`sendfile`) with buffered HTTP-like header:
+        {
+            var srv = try lo.listen(io, .{ .reuse_address = true });
+            defer srv.deinit(io);
+
+            const Receiver = struct {
+                srv_ptr: *Io.net.Server,
+                got: [6 + pattern_len]u8 = undefined,
+                got_len: usize = 0,
+
+                fn run(t_io: Io, self: *@This()) !void {
+                    const peer = try self.srv_ptr.accept(t_io);
+                    defer peer.close(t_io);
+                    var rbuf: [512]u8 = undefined;
+                    var sr = peer.reader(t_io, &rbuf);
+                    try sr.interface.readSliceAll(&self.got);
+                    self.got_len = self.got.len;
+                }
+            };
+            var rec: Receiver = .{ .srv_ptr = &srv };
+            var srv_fut = try io.concurrent(Receiver.run, .{ io, &rec });
+
+            const cli = try srv.socket.address.connect(io, .{ .mode = .stream });
+            defer cli.close(io);
+
+            const src_f = try cwd.openFile(io, src_path, .{});
+            defer src_f.close(io);
+            var fr_buf: [128]u8 = undefined;
+            var fr = src_f.reader(io, &fr_buf);
+            // Pre-read 10 bytes into `fr`'s user buffer so BOTH buffered drain + kernel `sendfile` execute!
+            const peeked = try fr.interface.peek(10);
+            try std.testing.expectEqualSlices(u8, pattern[0..10], peeked);
+
+            var sw_buf: [128]u8 = undefined;
+            var sw = cli.writer(io, &sw_buf);
+            try sw.interface.writeAll("200OK\n");
+            const sent_sock = try sw.interface.sendFileAll(&fr, .unlimited);
+            try sw.interface.flush();
+            try std.testing.expectEqual(pattern.len, sent_sock);
+
+            try srv_fut.await(io);
+            try std.testing.expectEqual(6 + pattern.len, rec.got_len);
+            try std.testing.expectEqualStrings("200OK\n", rec.got[0..6]);
+            try std.testing.expectEqualSlices(u8, &pattern, rec.got[6..]);
+        }
+    }
+}

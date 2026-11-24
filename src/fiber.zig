@@ -1,7 +1,8 @@
 //! Dual-platform stackful Fiber primitives and Shard-local watermark `StackPool`.
 //!
-//! - Linux (`x86_64`, `aarch64`): `mmap`-backed bounded stacks with a leading
-//!   `PROT_NONE` guard page and user-space ABI register switch.
+//! - Linux (`x86_64`, `aarch64`, `riscv64`): `mmap`-backed bounded stacks with a
+//!   leading `PROT_NONE` guard page, delegating register switching to upstream
+//!   `std.Io.fiber` and reclaiming cold stack physical pages via `MADV_DONTNEED`.
 //! - Windows (`x86_64`, `aarch64`): native Win32 Fibers (`ConvertThreadToFiberEx`,
 //!   `CreateFiberEx`, `SwitchToFiber`, `DeleteFiber`), preserving `NT_TIB` stack
 //!   bounds, `__chkstk` probes, SEH unwind chains, and non-volatile XMM state.
@@ -17,33 +18,31 @@ pub const default_stack_size: usize = 512 * 1024;
 pub const default_max_cached_stacks: usize = 64;
 pub const header_capacity: usize = 4096;
 
+/// Top portion of each cached Linux stack kept resident in physical RAM across
+/// reuses; deeper cold pages below this threshold are scavenged on Shard idle.
+const hot_stack_bytes: usize = 64 * 1024;
+
 pub const InitError = Allocator.Error || error{SystemResources};
 
 /// Saved execution context of an inactive Fiber or the Shard's thread/idle context.
 pub const ExecContext = switch (builtin.os.tag) {
-    .linux => switch (builtin.cpu.arch) {
-        .x86_64 => extern struct {
-            rsp: u64 = 0,
-            rbp: u64 = 0,
-            rip: u64 = 0,
-        },
-        .aarch64 => extern struct {
-            sp: u64 = 0,
-            fp: u64 = 0,
-            pc: u64 = 0,
-        },
-        else => |arch| @compileError("unsupported Linux architecture: " ++ @tagName(arch)),
-    },
+    .linux => std.Io.fiber.Context,
     .windows => struct {
         os_fiber: win32.LPVOID = undefined,
     },
     else => |os| @compileError("unsupported OS: " ++ @tagName(os)),
 };
 
+pub const zero_context: ExecContext = switch (builtin.os.tag) {
+    .linux => std.mem.zeroes(std.Io.fiber.Context),
+    .windows => .{},
+    else => unreachable,
+};
+
 /// Guard converting the current OS thread into a scheduling root context on Windows
 /// (no-op wrapper around `ExecContext` on Linux).
 pub const ThreadContext = struct {
-    ctx: ExecContext = .{},
+    ctx: ExecContext = zero_context,
     converted_by_us: if (builtin.os.tag == .windows) bool else void =
         if (builtin.os.tag == .windows) false else {},
 
@@ -77,199 +76,17 @@ pub const ThreadContext = struct {
     }
 };
 
-const LinuxSwitchPair = extern struct {
-    old: *ExecContext,
-    new: *ExecContext,
-};
-
 /// Switches CPU execution from `from` to `to`. Both contexts must belong to the
 /// calling OS thread.
 pub inline fn switchContext(from: *ExecContext, to: *ExecContext) void {
     switch (builtin.os.tag) {
         .linux => {
-            const pair: LinuxSwitchPair = .{ .old = from, .new = to };
-            linuxContextSwitch(&pair);
+            const s: std.Io.fiber.Switch = .{ .old = from, .new = to };
+            _ = std.Io.fiber.contextSwitch(&s);
         },
         .windows => {
             win32.SwitchToFiber(to.os_fiber);
         },
-        else => comptime unreachable,
-    }
-}
-
-inline fn linuxContextSwitch(pair: *const LinuxSwitchPair) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile (
-            \\ movq 0(%%rsi), %%rax
-            \\ movq 8(%%rsi), %%rcx
-            \\ leaq 0f(%%rip), %%rdx
-            \\ movq %%rsp, 0(%%rax)
-            \\ movq %%rbp, 8(%%rax)
-            \\ movq %%rdx, 16(%%rax)
-            \\ movq 0(%%rcx), %%rsp
-            \\ movq 8(%%rcx), %%rbp
-            \\ jmpq *16(%%rcx)
-            \\0:
-            :
-            : [p] "{rsi}" (pair),
-            : .{
-              .rax = true,
-              .rcx = true,
-              .rdx = true,
-              .rbx = true,
-              .rsi = true,
-              .rdi = true,
-              .r8 = true,
-              .r9 = true,
-              .r10 = true,
-              .r11 = true,
-              .r12 = true,
-              .r13 = true,
-              .r14 = true,
-              .r15 = true,
-              .mm0 = true,
-              .mm1 = true,
-              .mm2 = true,
-              .mm3 = true,
-              .mm4 = true,
-              .mm5 = true,
-              .mm6 = true,
-              .mm7 = true,
-              .zmm0 = true,
-              .zmm1 = true,
-              .zmm2 = true,
-              .zmm3 = true,
-              .zmm4 = true,
-              .zmm5 = true,
-              .zmm6 = true,
-              .zmm7 = true,
-              .zmm8 = true,
-              .zmm9 = true,
-              .zmm10 = true,
-              .zmm11 = true,
-              .zmm12 = true,
-              .zmm13 = true,
-              .zmm14 = true,
-              .zmm15 = true,
-              .zmm16 = true,
-              .zmm17 = true,
-              .zmm18 = true,
-              .zmm19 = true,
-              .zmm20 = true,
-              .zmm21 = true,
-              .zmm22 = true,
-              .zmm23 = true,
-              .zmm24 = true,
-              .zmm25 = true,
-              .zmm26 = true,
-              .zmm27 = true,
-              .zmm28 = true,
-              .zmm29 = true,
-              .zmm30 = true,
-              .zmm31 = true,
-              .fpsr = true,
-              .fpcr = true,
-              .mxcsr = true,
-              .rflags = true,
-              .dirflag = true,
-              .memory = true,
-            }),
-        .aarch64 => asm volatile (
-            \\ ldp x0, x2, [x1]
-            \\ ldr x3, [x2, #16]
-            \\ mov x4, sp
-            \\ stp x4, fp, [x0]
-            \\ adr x5, 0f
-            \\ ldp x4, fp, [x2]
-            \\ str x5, [x0, #16]
-            \\ mov sp, x4
-            \\ br x3
-            \\0:
-            :
-            : [p] "{x1}" (pair),
-            : .{
-              .x0 = true,
-              .x1 = true,
-              .x2 = true,
-              .x3 = true,
-              .x4 = true,
-              .x5 = true,
-              .x6 = true,
-              .x7 = true,
-              .x8 = true,
-              .x9 = true,
-              .x10 = true,
-              .x11 = true,
-              .x12 = true,
-              .x13 = true,
-              .x14 = true,
-              .x15 = true,
-              .x16 = true,
-              .x17 = true,
-              .x19 = true,
-              .x20 = true,
-              .x21 = true,
-              .x22 = true,
-              .x23 = true,
-              .x24 = true,
-              .x25 = true,
-              .x26 = true,
-              .x27 = true,
-              .x28 = true,
-              .x30 = true,
-              .z0 = true,
-              .z1 = true,
-              .z2 = true,
-              .z3 = true,
-              .z4 = true,
-              .z5 = true,
-              .z6 = true,
-              .z7 = true,
-              .z8 = true,
-              .z9 = true,
-              .z10 = true,
-              .z11 = true,
-              .z12 = true,
-              .z13 = true,
-              .z14 = true,
-              .z15 = true,
-              .z16 = true,
-              .z17 = true,
-              .z18 = true,
-              .z19 = true,
-              .z20 = true,
-              .z21 = true,
-              .z22 = true,
-              .z23 = true,
-              .z24 = true,
-              .z25 = true,
-              .z26 = true,
-              .z27 = true,
-              .z28 = true,
-              .z29 = true,
-              .z30 = true,
-              .z31 = true,
-              .p0 = true,
-              .p1 = true,
-              .p2 = true,
-              .p3 = true,
-              .p4 = true,
-              .p5 = true,
-              .p6 = true,
-              .p7 = true,
-              .p8 = true,
-              .p9 = true,
-              .p10 = true,
-              .p11 = true,
-              .p12 = true,
-              .p13 = true,
-              .p14 = true,
-              .p15 = true,
-              .fpcr = true,
-              .fpsr = true,
-              .ffr = true,
-              .memory = true,
-            }),
         else => comptime unreachable,
     }
 }
@@ -284,17 +101,20 @@ pub const EntryFn = *const fn (arg: *anyopaque) void;
 /// parked cleanly at root loop depth ready for zero-syscall `StackPool` reuse.
 pub const RawFiber = struct {
     header: [header_capacity]u8 align(16) = undefined,
-    ctx: ExecContext = .{},
+    ctx: ExecContext = zero_context,
     free_next: ?*RawFiber = null,
     entry_fn: EntryFn = undefined,
     entry_arg: *anyopaque = undefined,
     exit_target: ?*ExecContext = null,
+    cold_scavenged: bool = true,
     backing: Backing,
 
     const Backing = switch (builtin.os.tag) {
         .linux => struct {
             map_ptr: [*]align(std.heap.page_size_min) u8,
             map_len: usize,
+            usable_stack: usize,
+            page_size: usize,
         },
         .windows => struct {},
         else => unreachable,
@@ -308,6 +128,20 @@ pub const RawFiber = struct {
         self.entry_fn = entry_fn;
         self.entry_arg = entry_arg;
         self.exit_target = null;
+    }
+
+    /// Releases physical pages for stack memory below the top `hot_stack_bytes`
+    /// while keeping the virtual mapping intact (`MADV_DONTNEED`).
+    pub fn scavengeColdPages(self: *RawFiber) void {
+        if (builtin.os.tag == .linux) {
+            const keep = std.mem.alignForward(usize, hot_stack_bytes, self.backing.page_size);
+            if (self.backing.usable_stack > keep) {
+                const cold_ptr: [*]u8 = self.backing.map_ptr + self.backing.page_size;
+                const cold_len = self.backing.usable_stack - keep;
+                _ = linux.madvise(cold_ptr, cold_len, linux.MADV.DONTNEED);
+            }
+        }
+        self.cold_scavenged = true;
     }
 
     fn create(gpa: Allocator, stack_size: usize) InitError!*RawFiber {
@@ -342,7 +176,13 @@ pub const RawFiber = struct {
                 const raw_addr = @intFromPtr(map_ptr) + page_size + usable_stack;
                 const raw: *RawFiber = @ptrFromInt(raw_addr);
                 raw.* = .{
-                    .backing = .{ .map_ptr = map_ptr, .map_len = total_len },
+                    .cold_scavenged = false,
+                    .backing = .{
+                        .map_ptr = map_ptr,
+                        .map_len = total_len,
+                        .usable_stack = usable_stack,
+                        .page_size = page_size,
+                    },
                 };
 
                 // Prepare initial 16-byte aligned stack slot holding `raw` pointer.
@@ -358,12 +198,12 @@ pub const RawFiber = struct {
                         .rbp = 0,
                         .rip = @intFromPtr(&linuxFiberEntry),
                     },
-                    .aarch64 => .{
+                    .aarch64, .riscv64 => .{
                         .sp = init_sp,
                         .fp = 0,
                         .pc = @intFromPtr(&linuxFiberEntry),
                     },
-                    else => comptime unreachable,
+                    else => |arch| @compileError("unsupported Linux architecture: " ++ @tagName(arch)),
                 };
                 return raw;
             },
@@ -427,6 +267,14 @@ fn linuxFiberEntry() callconv(.naked) void {
             :
             : [loop] "X" (&linuxFiberLoop),
         ),
+        .riscv64 => asm volatile (
+            \\ li s0, 0
+            \\ li ra, 0
+            \\ ld a0, 0(sp)
+            \\ tail %[loop]
+            :
+            : [loop] "X" (&linuxFiberLoop),
+        ),
         else => comptime unreachable,
     }
 }
@@ -453,7 +301,8 @@ fn windowsFiberLoop(param: ?win32.LPVOID) callconv(.winapi) void {
     }
 }
 
-/// Shard-local lock-free (single-thread) Fiber stack cache with high-water-mark eviction.
+/// Shard-local lock-free (single-thread) LIFO Fiber stack cache with watermark
+/// eviction and amortized idle `MADV_DONTNEED` physical page scavenging.
 pub const StackPool = struct {
     stack_size: usize = default_stack_size,
     max_cached: usize = default_max_cached_stacks,
@@ -476,13 +325,14 @@ pub const StackPool = struct {
         if (self.free_head) |raw| {
             self.free_head = raw.free_next;
             raw.free_next = null;
+            raw.cold_scavenged = false;
             self.cached_count -= 1;
             return raw;
         }
         return RawFiber.create(gpa, self.stack_size);
     }
 
-    /// Returns `raw` to the local free list if below `max_cached`; otherwise
+    /// Returns `raw` to the local LIFO free list if below `max_cached`; otherwise
     /// immediately releases the stack back to the OS/allocator.
     /// Must NOT be called from `raw`'s own stack!
     pub fn release(self: *StackPool, gpa: Allocator, raw: *RawFiber) void {
@@ -493,6 +343,18 @@ pub const StackPool = struct {
             self.cached_count += 1;
         } else {
             raw.destroy(gpa);
+        }
+    }
+
+    /// Invoked before a Shard blocks in `epoll_wait`: walks only newly returned
+    /// LIFO head fibers (`!cold_scavenged`), zaps cold pages below the top 64 KiB,
+    /// and stops at the first already-scavenged fiber in O(k) amortized O(1).
+    pub fn scavengeIdle(self: *StackPool) void {
+        if (builtin.os.tag != .linux) return;
+        var cur = self.free_head;
+        while (cur) |raw| : (cur = raw.free_next) {
+            if (raw.cold_scavenged) break;
+            raw.scavengeColdPages();
         }
     }
 
@@ -509,12 +371,12 @@ pub const StackPool = struct {
     }
 };
 
-test "Fiber ping-pong context switch, stack reuse, and watermark eviction" {
+test "Fiber ping-pong context switch, stack reuse, watermark eviction, and idle cold-page scavenging" {
     const gpa = std.testing.allocator;
     var root_thread = try ThreadContext.init();
     defer root_thread.deinit();
 
-    var pool = StackPool.init(64 * 1024, 1);
+    var pool = StackPool.init(256 * 1024, 1);
     defer pool.deinit(gpa);
 
     const State = struct {
@@ -522,8 +384,15 @@ test "Fiber ping-pong context switch, stack reuse, and watermark eviction" {
         raw_ctx: *ExecContext,
         step: u32 = 0,
 
+        noinline fn touchDeepStack() void {
+            var buf: [128 * 1024]u8 = undefined;
+            @memset(&buf, 0xA5);
+            std.mem.doNotOptimizeAway(&buf);
+        }
+
         fn run(arg: *anyopaque) void {
             const s: *@This() = @ptrCast(@alignCast(arg));
+            touchDeepStack();
             s.step += 10;
             switchContext(s.raw_ctx, s.root_ctx);
             s.step += 20;
@@ -540,12 +409,17 @@ test "Fiber ping-pong context switch, stack reuse, and watermark eviction" {
     switchContext(&root_thread.ctx, &f1.ctx);
     try std.testing.expectEqual(@as(u32, 30), st1.step);
 
-    // Release f1 (cached_count becomes 1 == max_cached) and verify reuse returns same pointer.
+    // Release f1 (dirty deep stack), scavenge cold pages, then reuse f1 and touch deep stack again!
     pool.release(gpa, f1);
-    try std.testing.expectEqual(@as(usize, 1), pool.cached_count);
+    try std.testing.expect(!f1.cold_scavenged);
+    pool.scavengeIdle();
+    try std.testing.expect(f1.cold_scavenged);
+    // Second scavengeIdle hits `cold_scavenged == true` immediately with zero syscalls.
+    pool.scavengeIdle();
 
     const f1_reused = try pool.acquire(gpa);
     try std.testing.expectEqual(f1, f1_reused);
+    try std.testing.expect(!f1_reused.cold_scavenged);
 
     var st2: State = .{ .root_ctx = &root_thread.ctx, .raw_ctx = &f1_reused.ctx };
     f1_reused.arm(State.run, &st2);

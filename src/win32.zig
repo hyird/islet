@@ -36,6 +36,7 @@ pub const ERROR_HANDLE_EOF: u32 = 38;
 pub const ERROR_BROKEN_PIPE: u32 = 109;
 pub const ERROR_NETNAME_DELETED: u32 = 64;
 pub const ERROR_CONNECTION_REFUSED: u32 = 1225;
+pub const ERROR_PORT_UNREACHABLE: u32 = 1234;
 pub const ERROR_CONNECTION_ABORTED: u32 = 1236;
 pub const ERROR_SEM_TIMEOUT: u32 = 121;
 pub const WAIT_TIMEOUT: u32 = 258;
@@ -95,6 +96,10 @@ pub extern "kernel32" fn SetFileCompletionNotificationModes(
     Flags: UCHAR,
 ) callconv(.winapi) BOOL;
 
+pub extern "ntdll" fn RtlNtStatusToDosError(
+    Status: windows.NTSTATUS,
+) callconv(.winapi) ULONG;
+
 pub extern "kernel32" fn ReadFile(
     hFile: HANDLE,
     lpBuffer: ?[*]u8,
@@ -151,8 +156,38 @@ pub const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
 pub const WSA_FLAG_NO_HANDLE_INHERIT: DWORD = 0x80;
 
 pub const SO_EXCLUSIVEADDRUSE: c_int = ~@as(c_int, ws2_32.SO.REUSEADDR);
+pub const SO_PROTOCOL_INFOW: c_int = 0x2005;
+pub const XP1_IFS_HANDLES: DWORD = 0x00020000;
 pub const IPPROTO_IPV6: c_int = 41;
 pub const IPV6_V6ONLY: c_int = 27;
+
+pub const WSAPROTOCOLCHAIN = extern struct {
+    ChainLen: c_int,
+    ChainEntries: [7]DWORD,
+};
+
+pub const WSAPROTOCOL_INFOW = extern struct {
+    dwServiceFlags1: DWORD,
+    dwServiceFlags2: DWORD,
+    dwServiceFlags3: DWORD,
+    dwServiceFlags4: DWORD,
+    dwProviderFlags: DWORD,
+    ProviderId: GUID,
+    dwCatalogEntryId: DWORD,
+    ProtocolChain: WSAPROTOCOLCHAIN,
+    iVersion: c_int,
+    iAddressFamily: c_int,
+    iMaxSockAddr: c_int,
+    iMinSockAddr: c_int,
+    iSocketType: c_int,
+    iProtocol: c_int,
+    iProtocolMaxOffset: c_int,
+    iNetworkByteOrder: c_int,
+    iSecurityScheme: c_int,
+    dwMessageSize: DWORD,
+    dwProviderReserved: DWORD,
+    szProtocol: [256]u16,
+};
 
 pub const SD_RECEIVE: c_int = 0;
 pub const SD_SEND: c_int = 1;

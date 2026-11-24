@@ -4,8 +4,12 @@
 //! - Exclusive `epoll_fd` and `event_fd` per Shard; zero cross-thread fd sharing.
 //! - Each fd registers `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET` ONCE on first
 //!   `WouldBlock`, avoiding per-operation `EPOLL_CTL_MOD` syscalls.
-//! - Separate intrusive read/write waiter queues per fd slot with `generation`
-//!   tagging to ignore stale events from closed/reused fds within the same batch.
+//! - Compact 3-word intrusive `Waiter` (`@fieldParentPtr`-friendly, fits inline
+//!   inside `Io.Operation.Storage.Pending.Userdata` with zero heap allocation).
+//! - Pure edge-triggered waiter queues without sticky `HUP`/`ERR` flags: because
+//!   every caller attempts a nonblocking syscall immediately before `waitIo` on
+//!   the same single-threaded Shard, transient socket errors (e.g. UDP ICMP) or
+//!   half-closed streams never degenerate into spin loops.
 //! - `EPERM` from `epoll_ctl` (regular disk files / `/dev/null`) surfaces as
 //!   `error.PollUnsupported` so callers offload to `BlockingPool` transparently.
 
@@ -22,9 +26,9 @@ const Epoll = @This();
 pub const default_max_fds: u32 = 65536;
 const eventfd_sentinel: u64 = std.math.maxInt(u64);
 
-pub const Direction = enum {
-    read,
-    write,
+pub const Direction = enum(u1) {
+    read = 0,
+    write = 1,
 };
 
 pub const InitError = error{
@@ -41,25 +45,27 @@ pub const RegisterError = Allocator.Error || error{
     Unexpected,
 };
 
-/// Intrusive waiter node residing on a suspended Fiber's stack or `Batch` slot.
+/// Compact 3-pointer intrusive waiter node residing on a suspended Fiber's stack
+/// or directly inline inside `Io.Operation.Storage.Pending.Userdata`.
 pub const Waiter = struct {
     prev: ?*Waiter = null,
     next: ?*Waiter = null,
-    linked: bool = false,
-    ready: bool = false,
-    ctx: ?*anyopaque = null,
-    wake_fn: *const fn (?*anyopaque) void,
+    wake_fn: *const fn (*Waiter) void,
 };
 
 const WaitQueue = struct {
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
 
+    inline fn isLinked(self: *const WaitQueue, w: *const Waiter) bool {
+        return w.prev != null or self.head == w;
+    }
+
     fn pushBack(self: *WaitQueue, w: *Waiter) void {
-        assert(!w.linked);
+        assert(!self.isLinked(w));
+        assert(w.next == null);
         w.prev = self.tail;
         w.next = null;
-        w.linked = true;
         if (self.tail) |t| {
             t.next = w;
         } else {
@@ -70,7 +76,6 @@ const WaitQueue = struct {
 
     fn popFront(self: *WaitQueue) ?*Waiter {
         const w = self.head orelse return null;
-        assert(w.linked);
         self.head = w.next;
         if (self.head) |h| {
             h.prev = null;
@@ -79,12 +84,11 @@ const WaitQueue = struct {
         }
         w.prev = null;
         w.next = null;
-        w.linked = false;
         return w;
     }
 
     fn remove(self: *WaitQueue, w: *Waiter) void {
-        if (!w.linked) return;
+        if (!self.isLinked(w)) return;
         if (w.prev) |p| {
             p.next = w.next;
         } else {
@@ -97,23 +101,20 @@ const WaitQueue = struct {
         }
         w.prev = null;
         w.next = null;
-        w.linked = false;
     }
 
     fn wakeAll(self: *WaitQueue) usize {
         var count: usize = 0;
         while (self.popFront()) |w| {
-            w.ready = true;
             count += 1;
-            w.wake_fn(w.ctx);
+            w.wake_fn(w);
         }
         return count;
     }
 
     fn wakeOne(self: *WaitQueue) bool {
         const w = self.popFront() orelse return false;
-        w.ready = true;
-        w.wake_fn(w.ctx);
+        w.wake_fn(w);
         return true;
     }
 };
@@ -121,7 +122,6 @@ const WaitQueue = struct {
 const FdSlot = struct {
     generation: u32 = 1,
     registered: bool = false,
-    hup_or_err: bool = false,
     read_waiters: WaitQueue = .{},
     write_waiters: WaitQueue = .{},
 };
@@ -193,9 +193,7 @@ pub fn notifyFromAnyThread(self: *Epoll) void {
     }
 }
 
-/// Parks `waiter` for `dir` readiness on `fd`.
-/// If `fd` already observed sticky `EPOLLERR | EPOLLHUP`, marks `waiter.ready = true`
-/// and invokes `waiter.wake_fn` immediately.
+/// Parks `waiter` for `dir` readiness on `fd` after caller observed `EAGAIN`.
 pub fn waitIo(
     self: *Epoll,
     gpa: Allocator,
@@ -237,14 +235,6 @@ pub fn waitIo(
             else => |err| return posix.unexpectedErrno(err),
         }
         slot.registered = true;
-        slot.hup_or_err = false;
-    }
-
-    waiter.ready = false;
-    if (slot.hup_or_err) {
-        waiter.ready = true;
-        waiter.wake_fn(waiter.ctx);
-        return;
     }
 
     switch (dir) {
@@ -254,10 +244,9 @@ pub fn waitIo(
 }
 
 pub fn cancelWaiter(self: *Epoll, fd: linux.fd_t, dir: Direction, waiter: *Waiter) void {
-    if (!waiter.linked) return;
-    assert(fd >= 0);
+    if (fd < 0) return;
     const ufd: usize = @intCast(fd);
-    assert(ufd < self.slots.items.len);
+    if (ufd >= self.slots.items.len) return;
     const slot = &self.slots.items[ufd];
     switch (dir) {
         .read => slot.read_waiters.remove(waiter),
@@ -289,7 +278,6 @@ pub fn unregisterFd(self: *Epoll, fd: linux.fd_t) void {
     if (slot.registered) {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         slot.registered = false;
-        slot.hup_or_err = false;
         slot.generation +%= 1;
         if (slot.generation == 0 or slot.generation == std.math.maxInt(u32)) {
             slot.generation = 1;
@@ -325,7 +313,6 @@ pub fn poll(self: *Epoll, timeout_ms: i32) usize {
 
         const flags = ev.events;
         if ((flags & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0) {
-            slot.hup_or_err = true;
             _ = slot.read_waiters.wakeAll();
             _ = slot.write_waiters.wakeAll();
             continue;
@@ -358,7 +345,7 @@ inline fn packData(fd: linux.fd_t, generation: u32) u64 {
     return (@as(u64, generation) << 32) | @as(u64, raw_fd);
 }
 
-test "Epoll wakes on pipe readiness, rejects regular file with PollUnsupported, and handles doorbell" {
+test "Epoll wakes on pipe readiness, does not spin after transient socket error, and rejects regular files" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
 
     const gpa = std.testing.allocator;
@@ -379,23 +366,36 @@ test "Epoll wakes on pipe readiness, rejects regular file with PollUnsupported, 
         std.Io.Threaded.closeFd(fds[1]);
     }
 
-    const Flag = struct {
+    const Hook = struct {
+        waiter: Waiter,
         woken: bool = false,
-        fn wake(ctx: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        fn wake(w: *Waiter) void {
+            const self: *@This() = @fieldParentPtr("waiter", w);
             self.woken = true;
         }
     };
-    var flag: Flag = .{};
-    var waiter: Waiter = .{ .ctx = &flag, .wake_fn = Flag.wake };
-    try ep.waitIo(gpa, fds[0], .read, &waiter);
-    try std.testing.expect(!flag.woken);
+    var hook: Hook = .{ .waiter = .{ .wake_fn = Hook.wake } };
+    try ep.waitIo(gpa, fds[0], .read, &hook.waiter);
+    try std.testing.expect(!hook.woken);
 
     const msg = "ok";
     _ = linux.write(fds[1], msg.ptr, msg.len);
     _ = ep.poll(50);
-    try std.testing.expect(flag.woken);
-    try std.testing.expect(waiter.ready);
+    try std.testing.expect(hook.woken);
+
+    // Verify UDP transient ICMP EPOLLERR does NOT poison subsequent `waitIo` into synchronous spin!
+    const udp_rc = linux.socket(posix.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(linux.errno(udp_rc) == .SUCCESS);
+    const udp_fd: linux.fd_t = @intCast(udp_rc);
+    defer {
+        ep.unregisterFd(udp_fd);
+        std.Io.Threaded.closeFd(udp_fd);
+    }
+
+    var udp_hook: Hook = .{ .waiter = .{ .wake_fn = Hook.wake } };
+    try ep.waitIo(gpa, udp_fd, .read, &udp_hook.waiter);
+    try std.testing.expect(!udp_hook.woken);
+    ep.cancelWaiter(udp_fd, .read, &udp_hook.waiter);
 
     // Regular file (/dev/null) returns EPERM -> error.PollUnsupported
     const null_rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -403,6 +403,6 @@ test "Epoll wakes on pipe readiness, rejects regular file with PollUnsupported, 
     const null_fd: linux.fd_t = @intCast(null_rc);
     defer std.Io.Threaded.closeFd(null_fd);
 
-    var file_waiter: Waiter = .{ .ctx = &flag, .wake_fn = Flag.wake };
-    try std.testing.expectError(error.PollUnsupported, ep.waitIo(gpa, null_fd, .read, &file_waiter));
+    var file_hook: Hook = .{ .waiter = .{ .wake_fn = Hook.wake } };
+    try std.testing.expectError(error.PollUnsupported, ep.waitIo(gpa, null_fd, .read, &file_hook.waiter));
 }

@@ -136,7 +136,7 @@ const WindowsAcceptor = struct {
         for (listeners) |*l| l.* = .{};
 
         var iocp = try Iocp.init();
-        errdefer iocp.deinit();
+        errdefer iocp.deinit(gpa);
 
         self.* = .{
             .gpa = gpa,
@@ -153,7 +153,7 @@ const WindowsAcceptor = struct {
         for (self.shards) |*s| {
             s.inbox.deinit(gpa, closeAcceptedSocket);
         }
-        self.iocp.deinit();
+        self.iocp.deinit(gpa);
         gpa.free(self.listeners);
         gpa.free(self.tokens);
         gpa.free(self.shards);
@@ -255,7 +255,7 @@ const WindowsAcceptor = struct {
             }
             const bound_addr = Threaded.addressFromPosix(&bound_storage);
 
-            try self.iocp.associateHandle(win32.socketToHandle(sock), free_id);
+            try self.iocp.associateListenHandle(win32.socketToHandle(sock), free_id);
             const accept_ex = try Iocp.resolveAcceptEx(sock);
 
             const l = &self.listeners[free_id];

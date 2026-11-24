@@ -529,3 +529,185 @@ test "Shard & Runtime E2E: ConnectionRefused, recancel, Batch timeout, socketpai
         }.failOnOne, .{}));
     }
 }
+
+test "Refactor regressions: zero-heap steady-state Io.Batch and LIFO ping-pong anti-starvation" {
+    // Counting/gating allocator proving Linux `Io.Batch` allocates 0 bytes on the heap in steady state!
+    const GuardedAllocator = struct {
+        backing: std.mem.Allocator,
+        forbid_alloc: bool = false,
+        alloc_calls_while_forbidden: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid_alloc) {
+                self.alloc_calls_while_forbidden += 1;
+                return null;
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid_alloc and new_len > memory.len) {
+                self.alloc_calls_while_forbidden += 1;
+                return false;
+            }
+            return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid_alloc and new_len > memory.len) {
+                self.alloc_calls_while_forbidden += 1;
+                return null;
+            }
+            return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
+    var guarded: GuardedAllocator = .{ .backing = std.testing.allocator };
+    var shard: Shard = undefined;
+    try shard.init(guarded.allocator(), .{});
+    defer shard.deinit();
+    const io = shard.io();
+
+    const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const udp_rx = try lo.bind(io, .{ .mode = .dgram });
+    defer udp_rx.close(io);
+    const udp_tx = try lo.bind(io, .{ .mode = .dgram });
+    defer udp_tx.close(io);
+
+    // Warm fd slot table once on `udp_rx` before freezing heap allocations.
+    {
+        var warm_st: [1]Io.Operation.Storage = undefined;
+        var warm_batch: Io.Batch = .init(&warm_st);
+        defer warm_batch.cancel(io);
+        var warm_msg: [1]Io.net.IncomingMessage = .{.init};
+        var warm_buf: [16]u8 = undefined;
+        _ = warm_batch.add(.{ .net_receive = .{
+            .socket_handle = udp_rx.handle,
+            .message_buffer = &warm_msg,
+            .data_buffer = &warm_buf,
+            .flags = .{},
+        } });
+        // Park once before sending so `Epoll.slots` pre-grows its fd slot table on warmup.
+        try std.testing.expectError(
+            error.Timeout,
+            warm_batch.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }),
+        );
+        try udp_tx.send(io, &udp_rx.address, "warm");
+        try warm_batch.awaitConcurrent(io, .none);
+        _ = warm_batch.next().?;
+    }
+
+    if (builtin.os.tag == .linux) {
+        // Freeze heap allocations: `net_receive` must park in `Epoll` (`EAGAIN` first!) and complete with 0 allocs!
+        var high_socks: [16]Io.net.Socket = undefined;
+        var opened_high: usize = 0;
+        defer for (high_socks[0..opened_high]) |*s| s.close(io);
+        while (opened_high < high_socks.len) : (opened_high += 1) {
+            high_socks[opened_high] = try lo.bind(io, .{ .mode = .dgram });
+        }
+
+        guarded.forbid_alloc = true;
+        defer guarded.forbid_alloc = false;
+
+        var st: [1]Io.Operation.Storage = undefined;
+        var batch: Io.Batch = .init(&st);
+        defer batch.cancel(io);
+
+        var msg: [1]Io.net.IncomingMessage = .{.init};
+        var buf: [32]u8 = undefined;
+        _ = batch.add(.{ .net_receive = .{
+            .socket_handle = udp_rx.handle,
+            .message_buffer = &msg,
+            .data_buffer = &buf,
+            .flags = .{},
+        } });
+        // Submit BEFORE sending so `submitBatch` hits `.would_block` and parks `InlineBatchSlot` in `Epoll`!
+        try std.testing.expectError(
+            error.Timeout,
+            batch.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }),
+        );
+        try udp_tx.send(io, &udp_rx.address, "zero-alloc-ok");
+        try batch.awaitConcurrent(io, .none);
+        const comp = batch.next().?;
+        try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, null), comp.result.net_receive[0]);
+        try std.testing.expectEqualStrings("zero-alloc-ok", msg[0].data);
+        try std.testing.expectEqual(@as(usize, 0), guarded.alloc_calls_while_forbidden);
+
+        // Also verify `submitBatch` OOM rollback restores `.submission` cleanly for `batch.cancel`:
+        var oom_st: [1]Io.Operation.Storage = undefined;
+        var oom_batch: Io.Batch = .init(&oom_st);
+        defer oom_batch.cancel(io);
+        var oom_msg: [1]Io.net.IncomingMessage = .{.init};
+        var oom_buf: [16]u8 = undefined;
+        _ = oom_batch.add(.{ .net_receive = .{
+            .socket_handle = high_socks[high_socks.len - 1].handle,
+            .message_buffer = &oom_msg,
+            .data_buffer = &oom_buf,
+            .flags = .{},
+        } });
+        try std.testing.expectError(
+            error.ConcurrencyUnavailable,
+            oom_batch.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }),
+        );
+    }
+
+    // Verify bounded `lifo_slot` (`max_lifo_streak = 3`) does NOT starve queued FIFO tasks during tight ping-pong!
+    const PingPong = struct {
+        q_ab_buf: [1]u32 = undefined,
+        q_ba_buf: [1]u32 = undefined,
+        q_ab: Io.Queue(u32) = undefined,
+        q_ba: Io.Queue(u32) = undefined,
+        fifo_progress: usize = 0,
+    };
+    var pp: PingPong = .{};
+    pp.q_ab = .init(&pp.q_ab_buf);
+    pp.q_ba = .init(&pp.q_ba_buf);
+
+    var grp: Io.Group = .init;
+    defer grp.cancel(io);
+
+    try grp.concurrent(io, struct {
+        fn responder(g_io: Io, s: *PingPong) Io.Cancelable!void {
+            for (0..16) |_| {
+                const v = s.q_ab.getOne(g_io) catch return;
+                s.q_ba.putOne(g_io, v + 1) catch return;
+            }
+        }
+    }.responder, .{ io, &pp });
+
+    try grp.concurrent(io, struct {
+        fn backgroundFifo(g_io: Io, s: *PingPong) Io.Cancelable!void {
+            // Wakes via immediate 0ns sleep / futex so it sits in FIFO ready_queue alongside ping-pong
+            try g_io.sleep(.zero, .awake);
+            s.fifo_progress += 1;
+        }
+    }.backgroundFifo, .{ io, &pp });
+
+    for (0..16) |i| {
+        try pp.q_ab.putOne(io, @intCast(i));
+        const echoed = try pp.q_ba.getOne(io);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), echoed);
+    }
+    try grp.await(io);
+    try std.testing.expectEqual(@as(usize, 1), pp.fifo_progress);
+}

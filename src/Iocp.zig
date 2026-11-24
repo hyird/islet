@@ -3,12 +3,17 @@
 //! Design invariants (AGENTS.md §4):
 //! - Exclusive IOCP handle (`NumberOfConcurrentThreads = 1`) per Shard, harvested
 //!   in batches via `GetQueuedCompletionStatusEx`.
+//! - Enables `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE`
+//!   on IFS sockets and overlapped file/pipe handles so synchronous completions
+//!   return immediately in user space without Fiber context switching or IOCP traffic,
+//!   while tracking non-IFS legacy handles safely.
 //! - Coalesced cross-thread doorbell via `PostQueuedCompletionStatus`.
 //! - Tracks `in_flight_count` strictly: every kernel-owned `OVERLAPPED` increments
-//!   `in_flight_count` on `ERROR_IO_PENDING` and decrements ONLY when popped from
+//!   `in_flight_count` on pending submission and decrements ONLY when popped from
 //!   IOCP. Destroying `Iocp` while `in_flight_count != 0` triggers `@panic`.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const windows = std.os.windows;
 const win32 = @import("win32.zig");
@@ -38,6 +43,9 @@ pub const Completion = struct {
 iocp_handle: win32.HANDLE,
 doorbell: Doorbell = .init,
 in_flight_count: usize = 0,
+/// Handles where `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` could not be enabled
+/// (e.g. legacy non-IFS Winsock LSP). Empty in steady state on modern Windows.
+legacy_handles: std.ArrayListUnmanaged(win32.HANDLE) = .empty,
 entries_buf: [64]win32.OVERLAPPED_ENTRY = undefined,
 
 pub fn init() InitError!Iocp {
@@ -56,20 +64,99 @@ pub fn init() InitError!Iocp {
     };
 }
 
-pub fn deinit(self: *Iocp) void {
+pub fn deinit(self: *Iocp, gpa: Allocator) void {
     if (self.in_flight_count != 0) {
         @panic("islet.Iocp.deinit: in-flight OVERLAPPED operations not drained");
     }
+    self.legacy_handles.deinit(gpa);
     windows.CloseHandle(self.iocp_handle);
     self.* = undefined;
 }
 
-/// Associates a native `HANDLE` or Winsock `SOCKET` (`win32.socketToHandle`)
-/// with this Shard's IOCP for the first and only time.
-pub fn associateHandle(self: *Iocp, handle: win32.HANDLE, key: usize) error{Unexpected}!void {
+/// Associates a listening socket (where `AcceptEx` uniform completion queueing is desired)
+/// without enabling `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`.
+pub fn associateListenHandle(self: *Iocp, handle: win32.HANDLE, key: usize) error{Unexpected}!void {
     if (win32.CreateIoCompletionPort(handle, self.iocp_handle, key, 0) == null) {
         return windows.unexpectedError(windows.GetLastError());
     }
+}
+
+/// Associates an overlapped file/pipe `HANDLE` with this Shard's IOCP and attempts
+/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE`.
+pub fn associateFileHandle(
+    self: *Iocp,
+    gpa: Allocator,
+    handle: win32.HANDLE,
+    key: usize,
+) (Allocator.Error || error{Unexpected})!void {
+    if (win32.CreateIoCompletionPort(handle, self.iocp_handle, key, 0) == null) {
+        return windows.unexpectedError(windows.GetLastError());
+    }
+    const mode = win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | win32.FILE_SKIP_SET_EVENT_ON_HANDLE;
+    if (!win32.SetFileCompletionNotificationModes(handle, mode).toBool()) {
+        try self.legacy_handles.append(gpa, handle);
+    }
+}
+
+/// Associates a Winsock `SOCKET` with this Shard's IOCP for the first and only time,
+/// enabling `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` iff `XP1_IFS_HANDLES` is advertised.
+pub fn associateSocket(
+    self: *Iocp,
+    gpa: Allocator,
+    sock: win32.SOCKET,
+    key: usize,
+) (Allocator.Error || error{Unexpected})!void {
+    const handle = win32.socketToHandle(sock);
+    if (win32.CreateIoCompletionPort(handle, self.iocp_handle, key, 0) == null) {
+        return windows.unexpectedError(windows.GetLastError());
+    }
+    var proto_info: win32.WSAPROTOCOL_INFOW = undefined;
+    var info_len: c_int = @sizeOf(win32.WSAPROTOCOL_INFOW);
+    const is_ifs = win32.getsockopt(
+        sock,
+        win32.ws2_32.SOL.SOCKET,
+        win32.SO_PROTOCOL_INFOW,
+        @ptrCast(&proto_info),
+        &info_len,
+    ) == 0 and (proto_info.dwServiceFlags1 & win32.XP1_IFS_HANDLES) != 0;
+
+    if (is_ifs) {
+        const mode = win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | win32.FILE_SKIP_SET_EVENT_ON_HANDLE;
+        if (win32.SetFileCompletionNotificationModes(handle, mode).toBool()) {
+            return;
+        }
+    }
+    try self.legacy_handles.append(gpa, handle);
+}
+
+pub fn unregisterHandle(self: *Iocp, handle: win32.HANDLE) void {
+    if (self.legacy_handles.items.len == 0) {
+        @branchHint(.likely);
+        return;
+    }
+    for (self.legacy_handles.items, 0..) |item, idx| {
+        if (item == handle) {
+            _ = self.legacy_handles.swapRemove(idx);
+            return;
+        }
+    }
+}
+
+/// O(1) fast check in steady state (`legacy_handles.items.len == 0`).
+pub inline fn hasSkipOnSuccess(self: *const Iocp, handle: win32.HANDLE) bool {
+    if (self.legacy_handles.items.len == 0) {
+        @branchHint(.likely);
+        return true;
+    }
+    for (self.legacy_handles.items) |item| {
+        if (item == handle) return false;
+    }
+    return true;
+}
+
+pub inline fn ntStatusToWin32Error(status: windows.NTSTATUS) u32 {
+    if (status == .SUCCESS) return 0;
+    return win32.RtlNtStatusToDosError(status);
 }
 
 /// Safe from any thread: coalesces wakeups via `Doorbell` and posts a single

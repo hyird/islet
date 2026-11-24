@@ -81,23 +81,6 @@ pub fn associateListenHandle(self: *Iocp, handle: win32.HANDLE, key: usize) erro
     }
 }
 
-/// Associates an overlapped file/pipe `HANDLE` with this Shard's IOCP and attempts
-/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE`.
-pub fn associateFileHandle(
-    self: *Iocp,
-    gpa: Allocator,
-    handle: win32.HANDLE,
-    key: usize,
-) (Allocator.Error || error{Unexpected})!void {
-    if (win32.CreateIoCompletionPort(handle, self.iocp_handle, key, 0) == null) {
-        return windows.unexpectedError(windows.GetLastError());
-    }
-    const mode = win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | win32.FILE_SKIP_SET_EVENT_ON_HANDLE;
-    if (!win32.SetFileCompletionNotificationModes(handle, mode).toBool()) {
-        try self.legacy_handles.append(gpa, handle);
-    }
-}
-
 /// Associates a Winsock `SOCKET` with this Shard's IOCP for the first and only time,
 /// enabling `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` iff `XP1_IFS_HANDLES` is advertised.
 pub fn associateSocket(
@@ -217,9 +200,13 @@ pub fn poll(self: *Iocp, timeout_ms: u32) usize {
     return count;
 }
 
-pub fn resolveAcceptEx(sock: win32.SOCKET) error{Unexpected}!win32.LPFN_ACCEPTEX {
-    var guid = win32.WSAID_ACCEPTEX;
-    var fn_ptr: ?win32.LPFN_ACCEPTEX = null;
+pub fn resolveExtension(
+    comptime FnPtr: type,
+    sock: win32.SOCKET,
+    guid_val: win32.GUID,
+) error{Unexpected}!FnPtr {
+    var guid = guid_val;
+    var fn_ptr: ?FnPtr = null;
     var bytes: win32.DWORD = 0;
     const rc = win32.WSAIoctl(
         sock,
@@ -227,45 +214,7 @@ pub fn resolveAcceptEx(sock: win32.SOCKET) error{Unexpected}!win32.LPFN_ACCEPTEX
         &guid,
         @sizeOf(win32.GUID),
         @ptrCast(&fn_ptr),
-        @sizeOf(?win32.LPFN_ACCEPTEX),
-        &bytes,
-        null,
-        null,
-    );
-    if (rc == win32.SOCKET_ERROR or fn_ptr == null) return error.Unexpected;
-    return fn_ptr.?;
-}
-
-pub fn resolveConnectEx(sock: win32.SOCKET) error{Unexpected}!win32.LPFN_CONNECTEX {
-    var guid = win32.WSAID_CONNECTEX;
-    var fn_ptr: ?win32.LPFN_CONNECTEX = null;
-    var bytes: win32.DWORD = 0;
-    const rc = win32.WSAIoctl(
-        sock,
-        win32.SIO_GET_EXTENSION_FUNCTION_POINTER,
-        &guid,
-        @sizeOf(win32.GUID),
-        @ptrCast(&fn_ptr),
-        @sizeOf(?win32.LPFN_CONNECTEX),
-        &bytes,
-        null,
-        null,
-    );
-    if (rc == win32.SOCKET_ERROR or fn_ptr == null) return error.Unexpected;
-    return fn_ptr.?;
-}
-
-pub fn resolveWsaRecvMsg(sock: win32.SOCKET) error{Unexpected}!win32.LPFN_WSARECVMSG {
-    var guid = win32.WSAID_WSARECVMSG;
-    var fn_ptr: ?win32.LPFN_WSARECVMSG = null;
-    var bytes: win32.DWORD = 0;
-    const rc = win32.WSAIoctl(
-        sock,
-        win32.SIO_GET_EXTENSION_FUNCTION_POINTER,
-        &guid,
-        @sizeOf(win32.GUID),
-        @ptrCast(&fn_ptr),
-        @sizeOf(?win32.LPFN_WSARECVMSG),
+        @sizeOf(?FnPtr),
         &bytes,
         null,
         null,

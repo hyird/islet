@@ -33,7 +33,6 @@ const TimerHeap = @import("TimerHeap.zig");
 const AcceptorMod = @import("Acceptor.zig");
 const Acceptor = AcceptorMod.Acceptor;
 const AcceptedSocket = AcceptorMod.AcceptedSocket;
-const time = @import("time.zig");
 
 const WindowsIo = @This();
 
@@ -191,11 +190,10 @@ pub inline fn isAcceptorEmptySeqCst(self: *const WindowsIo) bool {
     return true;
 }
 
-pub fn drainAcceptor(self: *WindowsIo) usize {
+pub fn drainAcceptor(self: *WindowsIo) void {
     if (self.acceptor) |acc| {
-        return acc.drainShardInbox(self.shard_id, self, onAcceptedSocket);
+        _ = acc.drainShardInbox(self.shard_id, self, onAcceptedSocket);
     }
-    return 0;
 }
 
 fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
@@ -217,7 +215,7 @@ fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
     }
     const acc = self.acceptor.?;
     if (!q.pushBounded(self.gpa, acc.inboxCapacity(), accepted)) {
-        acc.noteShardSocketDropped(self.shard_id);
+        acc.releaseShardLoad(self.shard_id);
         _ = win32.closesocket(accepted.raw_sock);
     }
 }
@@ -241,7 +239,7 @@ pub fn onStopRequested(self: *WindowsIo) void {
 
 pub fn poll(self: *WindowsIo, wait_ns: ?i96) usize {
     const timeout_ms: u32 = if (wait_ns) |ns|
-        @intCast(time.ceilWaitMs(ns))
+        @intCast(TimerHeap.ceilWaitMs(ns))
     else
         win32.INFINITE;
     return self.poller.poll(timeout_ms);
@@ -290,7 +288,8 @@ pub fn fileWriteFileStreaming(
 ) File.Writer.WriteFileError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
     const reader_buffered = file_reader.interface.buffered();
-    if (reader_buffered.len >= @backingInt(limit)) {
+    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
+    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
         const op_res = try self.operate(shard, .{ .file_write_streaming = .{
             .file = file,
             .header = header,
@@ -301,23 +300,7 @@ pub fn fileWriteFileStreaming(
         file_reader.interface.toss(n -| header.len);
         return n;
     }
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) {
-            if (header.len != 0 or reader_buffered.len != 0) {
-                const op_res = try self.operate(shard, .{ .file_write_streaming = .{
-                    .file = file,
-                    .header = header,
-                    .data = &.{limit.slice(reader_buffered)},
-                    .splat = 1,
-                } });
-                const n = try op_res.file_write_streaming;
-                file_reader.interface.toss(n -| header.len);
-                return n;
-            }
-            return error.EndOfStream;
-        }
-    }
-    return error.Unimplemented;
+    return if (at_eof) error.EndOfStream else error.Unimplemented;
 }
 
 pub fn fileWriteFilePositional(
@@ -331,8 +314,9 @@ pub fn fileWriteFilePositional(
 ) File.WriteFilePositionalError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
     const reader_buffered = file_reader.interface.buffered();
-    const shard_io = shard.io();
-    if (reader_buffered.len >= @backingInt(limit)) {
+    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
+    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
+        const shard_io = shard.io();
         const n = try shard_io.vtable.fileWritePositional(
             shard_io.userdata,
             file,
@@ -344,24 +328,7 @@ pub fn fileWriteFilePositional(
         file_reader.interface.toss(n -| header.len);
         return n;
     }
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) {
-            if (header.len != 0 or reader_buffered.len != 0) {
-                const n = try shard_io.vtable.fileWritePositional(
-                    shard_io.userdata,
-                    file,
-                    header,
-                    &.{limit.slice(reader_buffered)},
-                    1,
-                    offset,
-                );
-                file_reader.interface.toss(n -| header.len);
-                return n;
-            }
-            return error.EndOfStream;
-        }
-    }
-    return error.Unimplemented;
+    return if (at_eof) error.EndOfStream else error.Unimplemented;
 }
 
 pub fn processSpawn(_: *WindowsIo, shard: anytype, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
@@ -543,11 +510,35 @@ fn fillWriteWsabufs(
     return @intCast(len);
 }
 
+fn fillReadWsabufs(bufs: *[Threaded.max_iovecs_len]win32.WSABUF, data: []const []u8) u32 {
+    var n_bufs: u32 = 0;
+    for (data) |b| {
+        if (n_bufs == bufs.len) break;
+        if (b.len > 0) {
+            bufs[n_bufs] = .{ .len = @intCast(@min(b.len, std.math.maxInt(u32))), .buf = b.ptr };
+            n_bufs += 1;
+        }
+    }
+    return n_bufs;
+}
+
+fn firstWriteSlice(header: []const u8, data: []const []const u8, splat: usize) ?[]const u8 {
+    if (header.len > 0) return header;
+    if (data.len == 0) return null;
+    for (data[0 .. data.len - 1]) |b| if (b.len > 0) return b;
+    if (splat > 0 and data[data.len - 1].len > 0) return data[data.len - 1];
+    return null;
+}
+
 fn blockingOperateOnThreaded(t: *Threaded, op: Io.Operation) Io.Operation.Result {
     const t_io = t.io();
     return t_io.vtable.operate(t_io.userdata, op) catch |err| switch (err) {
         error.Canceled => unreachable,
     };
+}
+
+fn runBlockingOperate(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    return blockingOperateOnThreaded(t, op_arg);
 }
 
 pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
@@ -556,11 +547,7 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
     switch (operation) {
         .file_read_streaming => |o| {
             if (!o.file.flags.nonblocking) {
-                return try shard.callBlocking(true, struct {
-                    fn run(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-                        return blockingOperateOnThreaded(t, op_arg);
-                    }
-                }.run, .{operation});
+                return shard.callBlocking(true, runBlockingOperate, .{operation});
             }
             const dest = for (o.data) |b| {
                 if (b.len > 0) break b;
@@ -594,19 +581,9 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
         },
         .file_write_streaming => |o| {
             if (!o.file.flags.nonblocking) {
-                return try shard.callBlocking(true, struct {
-                    fn run(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-                        return blockingOperateOnThreaded(t, op_arg);
-                    }
-                }.run, .{operation});
+                return shard.callBlocking(true, runBlockingOperate, .{operation});
             }
-            const src: []const u8 = blk: {
-                if (o.header.len > 0) break :blk o.header;
-                if (o.data.len == 0) return .{ .file_write_streaming = 0 };
-                for (o.data[0 .. o.data.len - 1]) |b| if (b.len > 0) break :blk b;
-                if (o.splat > 0 and o.data[o.data.len - 1].len > 0) break :blk o.data[o.data.len - 1];
-                return .{ .file_write_streaming = 0 };
-            };
+            const src = firstWriteSlice(o.header, o.data, o.splat) orelse return .{ .file_write_streaming = 0 };
             var sync_bytes: win32.DWORD = 0;
             var comp: Iocp.Completion = .{ .callback = undefined };
             const ok = win32.WriteFile(
@@ -634,26 +611,15 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             return .{ .file_write_streaming = res.bytes };
         },
         .device_io_control => {
-            return try shard.callBlocking(true, struct {
-                fn run(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-                    return blockingOperateOnThreaded(t, op_arg);
-                }
-            }.run, .{operation});
+            return shard.callBlocking(true, runBlockingOperate, .{operation});
         },
         .net_read => |o| {
             var bufs: [Threaded.max_iovecs_len]win32.WSABUF = undefined;
-            var n_bufs: u32 = 0;
-            for (o.data) |b| {
-                if (n_bufs == bufs.len) break;
-                if (b.len > 0) {
-                    bufs[n_bufs] = .{ .len = @intCast(@min(b.len, std.math.maxInt(u32))), .buf = b.ptr };
-                    n_bufs += 1;
-                }
-            }
+            const n_bufs = fillReadWsabufs(&bufs, o.data);
             if (n_bufs == 0 and o.control.len == 0) return .{ .net_read = .{ .data_len = 0 } };
             const sock = win32.handleToSocket(o.socket_handle);
             if (o.control.len > 0) {
-                const recv_msg = Iocp.resolveWsaRecvMsg(sock) catch return .{ .net_read = error.Unexpected };
+                const recv_msg = Iocp.resolveExtension(win32.LPFN_WSARECVMSG, sock, win32.WSAID_WSARECVMSG) catch return .{ .net_read = error.Unexpected };
                 var wmsg: win32.WSAMSG = .{
                     .name = null,
                     .namelen = 0,
@@ -1069,15 +1035,7 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
         },
         .file_write_streaming => |o| {
             if (!o.file.flags.nonblocking) return self.submitBatchOpBlocking(bop);
-            const src: []const u8 = blk: {
-                if (o.header.len > 0) break :blk o.header;
-                if (o.data.len == 0) {
-                    bop.result = .{ .file_write_streaming = 0 };
-                    finishBatchOp(bop);
-                    return;
-                }
-                for (o.data[0 .. o.data.len - 1]) |b| if (b.len > 0) break :blk b;
-                if (o.splat > 0 and o.data[o.data.len - 1].len > 0) break :blk o.data[o.data.len - 1];
+            const src = firstWriteSlice(o.header, o.data, o.splat) orelse {
                 bop.result = .{ .file_write_streaming = 0 };
                 finishBatchOp(bop);
                 return;
@@ -1109,14 +1067,7 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
                 .handle = o.socket_handle,
                 .comp = .{ .ctx = bop, .callback = onBatchIocpComplete },
             } };
-            var n_bufs: u32 = 0;
-            for (o.data) |b| {
-                if (n_bufs == bop.backend.iocp.wsabufs.len) break;
-                if (b.len > 0) {
-                    bop.backend.iocp.wsabufs[n_bufs] = .{ .len = @intCast(@min(b.len, std.math.maxInt(u32))), .buf = b.ptr };
-                    n_bufs += 1;
-                }
-            }
+            const n_bufs = fillReadWsabufs(&bop.backend.iocp.wsabufs, o.data);
             if (n_bufs == 0) {
                 bop.result = .{ .net_read = .{ .data_len = 0 } };
                 finishBatchOp(bop);
@@ -1297,6 +1248,17 @@ pub fn cancelBatchPending(self: *WindowsIo, batch: *Io.Batch) void {
 
 // ── Networking (`net*` — Native Windows `IOCP` + `Acceptor` Adoption) ────────
 
+inline fn openOverlappedSocket(family: c_int, mode: u32, protocol: u32) win32.SOCKET {
+    return win32.WSASocketW(
+        family,
+        @intCast(mode),
+        @intCast(protocol),
+        null,
+        0,
+        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
+    );
+}
+
 pub fn netListenIp(
     self: *WindowsIo,
     shard: anytype,
@@ -1310,35 +1272,28 @@ pub fn netListenIp(
     }
     const family = Threaded.posixAddressFamily(address);
     const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
-    const sock = win32.WSASocketW(
-        family,
-        @intCast(mode),
-        @intCast(protocol),
-        null,
-        0,
-        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
-    );
-    if (sock == win32.INVALID_SOCKET) return mapListenErr(win32.WSAGetLastError());
+    const sock = openOverlappedSocket(family, mode, protocol);
+    if (sock == win32.INVALID_SOCKET) return mapBindOrListenErr(win32.WSAGetLastError());
     errdefer _ = win32.closesocket(sock);
 
     const excl: c_int = 1;
     if (win32.setsockopt(sock, win32.ws2_32.SOL.SOCKET, win32.SO_EXCLUSIVEADDRUSE, @ptrCast(&excl), @sizeOf(c_int)) == win32.SOCKET_ERROR) {
-        return mapListenErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
 
     var storage: Threaded.PosixAddress = undefined;
     const addr_len = Threaded.addressToPosix(address, &storage);
     if (win32.bind(sock, &storage.any, @intCast(addr_len)) == win32.SOCKET_ERROR) {
-        return mapListenErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
     const backlog: c_int = @intCast(@min(options.kernel_backlog, std.math.maxInt(c_int)));
     if (win32.listen(sock, backlog) == win32.SOCKET_ERROR) {
-        return mapListenErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
     var bound: Threaded.PosixAddress = undefined;
     var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
     if (win32.getsockname(sock, &bound.any, &bound_len) == win32.SOCKET_ERROR) {
-        return mapListenErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
     const handle = win32.socketToHandle(sock);
     try self.poller.associateListenHandle(handle, 0);
@@ -1369,15 +1324,8 @@ pub fn netAccept(
     const mode, const protocol = Threaded.posixSocketModeProtocol(family, options.mode, options.protocol) catch {
         return error.ProtocolFailure;
     };
-    const accept_ex = try Iocp.resolveAcceptEx(listen_sock);
-    const accept_sock = win32.WSASocketW(
-        family,
-        @intCast(mode),
-        @intCast(protocol),
-        null,
-        0,
-        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
-    );
+    const accept_ex = try Iocp.resolveExtension(win32.LPFN_ACCEPTEX, listen_sock, win32.WSAID_ACCEPTEX);
+    const accept_sock = openOverlappedSocket(family, mode, protocol);
     if (accept_sock == win32.INVALID_SOCKET) return error.SystemResources;
     errdefer _ = win32.closesocket(accept_sock);
 
@@ -1438,7 +1386,7 @@ pub fn netAccept(
 }
 
 fn acceptFromAcceptor(self: *WindowsIo, shard: anytype, acc: *Acceptor, listener_id: u32) net.Server.AcceptError!net.Socket {
-    _ = shard.drainIncoming();
+    shard.drainIncoming();
 
     const ShardPtr = @TypeOf(shard);
     const q = &self.shared_accepts[listener_id];
@@ -1497,7 +1445,7 @@ fn acceptFromAcceptor(self: *WindowsIo, shard: anytype, acc: *Acceptor, listener
         break :blk waiter.delivered.?;
     };
 
-    acc.noteShardSocketAdopted(self.shard_id);
+    acc.releaseShardLoad(self.shard_id);
     errdefer _ = win32.closesocket(conn.raw_sock);
 
     // First and ONLY IOCP association of this accepted SOCKET happens right here on the target Shard!
@@ -1516,15 +1464,8 @@ pub fn netBindIp(
 ) net.IpAddress.BindError!net.Socket {
     const family = Threaded.posixAddressFamily(address);
     const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
-    const sock = win32.WSASocketW(
-        family,
-        @intCast(mode),
-        @intCast(protocol),
-        null,
-        0,
-        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
-    );
-    if (sock == win32.INVALID_SOCKET) return mapBindErr(win32.WSAGetLastError());
+    const sock = openOverlappedSocket(family, mode, protocol);
+    if (sock == win32.INVALID_SOCKET) return mapBindOrListenErr(win32.WSAGetLastError());
     errdefer _ = win32.closesocket(sock);
 
     if (options.ip6_only) |v6only| {
@@ -1543,12 +1484,12 @@ pub fn netBindIp(
     var storage: Threaded.PosixAddress = undefined;
     const addr_len = Threaded.addressToPosix(address, &storage);
     if (win32.bind(sock, &storage.any, @intCast(addr_len)) == win32.SOCKET_ERROR) {
-        return mapBindErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
     var bound: Threaded.PosixAddress = undefined;
     var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
     if (win32.getsockname(sock, &bound.any, &bound_len) == win32.SOCKET_ERROR) {
-        return mapBindErr(win32.WSAGetLastError());
+        return mapBindOrListenErr(win32.WSAGetLastError());
     }
     self.poller.associateSocket(self.gpa, sock, 0) catch return error.SystemResources;
     return .{
@@ -1566,14 +1507,7 @@ pub fn netConnectIp(
 ) net.IpAddress.ConnectError!net.Socket {
     const family = Threaded.posixAddressFamily(address);
     const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
-    const sock = win32.WSASocketW(
-        family,
-        @intCast(mode),
-        @intCast(protocol),
-        null,
-        0,
-        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
-    );
+    const sock = openOverlappedSocket(family, mode, protocol);
     if (sock == win32.INVALID_SOCKET) return mapConnectErr(win32.WSAGetLastError());
     errdefer _ = win32.closesocket(sock);
 
@@ -1591,7 +1525,7 @@ pub fn netConnectIp(
     self.poller.associateSocket(self.gpa, sock, 0) catch return error.SystemResources;
     errdefer self.poller.unregisterHandle(handle);
 
-    const connect_ex = try Iocp.resolveConnectEx(sock);
+    const connect_ex = try Iocp.resolveExtension(win32.LPFN_CONNECTEX, sock, win32.WSAID_CONNECTEX);
     var dest_st: Threaded.PosixAddress = undefined;
     const dest_len = Threaded.addressToPosix(address, &dest_st);
     var comp: Iocp.Completion = .{ .callback = undefined };
@@ -1637,7 +1571,7 @@ pub fn netListenUnix(
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
     if (!net.has_unix_sockets) return error.AddressFamilyUnsupported;
-    const sock = win32.WSASocketW(win32.ws2_32.AF.UNIX, win32.ws2_32.SOCK.STREAM, 0, null, 0, win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT);
+    const sock = openOverlappedSocket(win32.ws2_32.AF.UNIX, win32.ws2_32.SOCK.STREAM, 0);
     if (sock == win32.INVALID_SOCKET) return error.AddressFamilyUnsupported;
     errdefer _ = win32.closesocket(sock);
     var sun: posix.sockaddr.un = undefined;
@@ -1655,14 +1589,7 @@ pub fn netConnectUnix(
     ua: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
     if (!net.has_unix_sockets) return error.AddressFamilyUnsupported;
-    const sock = win32.WSASocketW(
-        win32.ws2_32.AF.UNIX,
-        win32.ws2_32.SOCK.STREAM,
-        0,
-        null,
-        0,
-        win32.WSA_FLAG_OVERLAPPED | win32.WSA_FLAG_NO_HANDLE_INHERIT,
-    );
+    const sock = openOverlappedSocket(win32.ws2_32.AF.UNIX, win32.ws2_32.SOCK.STREAM, 0);
     if (sock == win32.INVALID_SOCKET) return error.AddressFamilyUnsupported;
     errdefer _ = win32.closesocket(sock);
 
@@ -1676,7 +1603,7 @@ pub fn netConnectUnix(
     self.poller.associateSocket(self.gpa, sock, 0) catch return error.SystemResources;
     errdefer self.poller.unregisterHandle(handle);
 
-    const connect_ex = try Iocp.resolveConnectEx(sock);
+    const connect_ex = try Iocp.resolveExtension(win32.LPFN_CONNECTEX, sock, win32.WSAID_CONNECTEX);
     var dest_un: posix.sockaddr.un = undefined;
     const dest_len = fillUnixSockaddr(ua, &dest_un);
     var comp: Iocp.Completion = .{ .callback = undefined };
@@ -1717,7 +1644,8 @@ pub fn netWriteFile(
 ) net.Stream.Writer.WriteFileError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
     const reader_buffered = file_reader.interface.buffered();
-    if (reader_buffered.len >= @backingInt(limit)) {
+    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
+    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
         const op_res = try self.operate(shard, .{ .net_write = .{
             .socket_handle = socket_handle,
             .header = header,
@@ -1728,23 +1656,7 @@ pub fn netWriteFile(
         file_reader.interface.toss(n -| header.len);
         return n;
     }
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) {
-            if (header.len != 0 or reader_buffered.len != 0) {
-                const op_res = try self.operate(shard, .{ .net_write = .{
-                    .socket_handle = socket_handle,
-                    .header = header,
-                    .data = &.{limit.slice(reader_buffered)},
-                    .splat = 1,
-                } });
-                const n = try op_res.net_write;
-                file_reader.interface.toss(n -| header.len);
-                return n;
-            }
-            return error.EndOfStream;
-        }
-    }
-    return error.Unimplemented;
+    return if (at_eof) error.EndOfStream else error.Unimplemented;
 }
 
 pub fn netSocketCreatePair(
@@ -1907,22 +1819,20 @@ fn mapNetSendError(code: c_int) net.Socket.SendError {
     };
 }
 
-fn mapListenErr(code: c_int) net.IpAddress.ListenError {
-    return switch (code) {
-        win32.WSAEADDRINUSE => error.AddressInUse,
-        win32.WSAEADDRNOTAVAIL => error.AddressUnavailable,
-        win32.WSAEACCES => error.AccessDenied,
-        win32.WSAEAFNOSUPPORT => error.AddressFamilyUnsupported,
-        win32.WSAEPROTONOSUPPORT => error.ProtocolUnsupportedByAddressFamily,
-        win32.WSAEPROTOTYPE, win32.WSAESOCKTNOSUPPORT => error.SocketModeUnsupported,
-        win32.WSAEMFILE => error.ProcessFdQuotaExceeded,
-        win32.WSAENOBUFS => error.SystemResources,
-        win32.WSAENETDOWN => error.NetworkDown,
-        else => error.Unexpected,
-    };
-}
+const WinsockBindListenError = error{
+    AddressInUse,
+    AddressUnavailable,
+    AccessDenied,
+    AddressFamilyUnsupported,
+    ProtocolUnsupportedByAddressFamily,
+    SocketModeUnsupported,
+    ProcessFdQuotaExceeded,
+    SystemResources,
+    NetworkDown,
+    Unexpected,
+};
 
-fn mapBindErr(code: c_int) net.IpAddress.BindError {
+fn mapBindOrListenErr(code: c_int) WinsockBindListenError {
     return switch (code) {
         win32.WSAEADDRINUSE => error.AddressInUse,
         win32.WSAEADDRNOTAVAIL => error.AddressUnavailable,

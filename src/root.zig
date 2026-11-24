@@ -22,7 +22,6 @@ comptime {
 
 test {
     // Pull in internal unit tests without exposing internal submodules publicly.
-    _ = @import("time.zig");
     _ = @import("TimerHeap.zig");
     _ = @import("SpscRing.zig");
     _ = @import("Mailbox.zig");

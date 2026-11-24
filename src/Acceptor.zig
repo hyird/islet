@@ -8,8 +8,8 @@
 //! - The Acceptor owns one exclusive listener `SOCKET` per shared endpoint on its
 //!   own IOCP, keeps `accepts_per_listener` `AcceptEx` calls in flight using raw
 //!   unassociated `SOCKET`s, reserves a slot in the least-loaded subscribed Shard's
-//!   bounded `Mailbox` before handoff (closing and counting refused sockets when
-//!   full), and lets the target Shard associate the `SOCKET` with its own IOCP
+//!   bounded `Mailbox` before handoff (closing refused sockets when full), and lets
+//!   the target Shard associate the `SOCKET` with its own IOCP
 //!   for the first and only time in `netAccept`.
 //! - On Linux (where kernel `SO_REUSEPORT` distributes directly to each Shard's
 //!   `epoll`), `Acceptor` compiles to a zero-sized no-op struct.
@@ -104,7 +104,6 @@ const WindowsAcceptor = struct {
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     joined: bool = false,
-    refused_count: std.atomic.Value(usize) = .init(0),
 
     inline fn kernelIo() std.Io {
         return std.Io.Threaded.global_single_threaded.io();
@@ -208,7 +207,7 @@ const WindowsAcceptor = struct {
         // Match existing shared listener if already bound for this endpoint.
         var found_id: ?u32 = null;
         for (self.listeners, 0..) |*l, idx| {
-            if (l.active and !l.closing and ipAddressEql(l.requested_addr, address.*) and
+            if (l.active and !l.closing and std.meta.eql(l.requested_addr, address.*) and
                 l.sock_type == @as(c_int, @intCast(mode_proto[0])) and
                 l.protocol == @as(c_int, @intCast(mode_proto[1])))
             {
@@ -262,7 +261,7 @@ const WindowsAcceptor = struct {
             const bound_addr = Threaded.addressFromPosix(&bound_storage);
 
             try self.iocp.associateListenHandle(win32.socketToHandle(sock), free_id);
-            const accept_ex = try Iocp.resolveAcceptEx(sock);
+            const accept_ex = try Iocp.resolveExtension(win32.LPFN_ACCEPTEX, sock, win32.WSAID_ACCEPTEX);
 
             const l = &self.listeners[free_id];
             l.* = .{
@@ -373,13 +372,8 @@ const WindowsAcceptor = struct {
         return self.inbox_capacity;
     }
 
-    pub fn noteShardSocketAdopted(self: *WindowsAcceptor, shard_id: usize) void {
+    pub fn releaseShardLoad(self: *WindowsAcceptor, shard_id: usize) void {
         _ = self.shards[shard_id].active_load.fetchSub(1, .monotonic);
-    }
-
-    pub fn noteShardSocketDropped(self: *WindowsAcceptor, shard_id: usize) void {
-        _ = self.shards[shard_id].active_load.fetchSub(1, .monotonic);
-        _ = self.refused_count.fetchAdd(1, .monotonic);
     }
 
     pub fn requestStop(self: *WindowsAcceptor) void {
@@ -523,7 +517,6 @@ const WindowsAcceptor = struct {
                         };
                         chosen_shard = sid;
                     } else {
-                        _ = self.refused_count.fetchAdd(1, .monotonic);
                         raw_to_close = raw_sock;
                     }
                 } else {
@@ -557,7 +550,6 @@ const WindowsAcceptor = struct {
                 },
                 .queue_full, .closed => |rejected| {
                     _ = self.shards[sid].active_load.fetchSub(1, .monotonic);
-                    _ = self.refused_count.fetchAdd(1, .monotonic);
                     _ = win32.closesocket(rejected.raw_sock);
                 },
             }
@@ -590,10 +582,6 @@ const WindowsAcceptor = struct {
             _ = win32.closesocket(item.raw_sock);
             item.raw_sock = win32.INVALID_SOCKET;
         }
-    }
-
-    fn ipAddressEql(a: net.IpAddress, b: net.IpAddress) bool {
-        return std.meta.eql(a, b);
     }
 
     fn mapWinsockListenError(code: c_int) net.IpAddress.ListenError {

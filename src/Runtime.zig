@@ -158,11 +158,6 @@ pub fn deinit(self: *Runtime) void {
         self.requestStop();
         self.joinThreadsOnly();
     }
-    if (self.active_runner_ctx) |ctx| {
-        self.cleanup_runner_fn.?(self.gpa, ctx);
-        self.active_runner_ctx = null;
-        self.cleanup_runner_fn = null;
-    }
 
     const gpa = self.gpa;
     for (self.shards) |*s| s.deinitUnattached();
@@ -234,6 +229,13 @@ pub fn EntryReturnErrorSet(comptime Fn: type) ?type {
     };
 }
 
+fn ErrorCapture(comptime E: type) type {
+    return struct {
+        lock: Io.Mutex = .init,
+        first_err: ?E = null,
+    };
+}
+
 /// Phase 2 (non-blocking): spawns all Shard threads, waits on the startup
 /// readiness barrier until every Shard loop is attached, and returns while
 /// Shards execute `function` concurrently. Call `join()` to await completion.
@@ -247,6 +249,16 @@ pub fn start(
     comptime function: anytype,
     extra_args: ExtraArgsTuple(@TypeOf(function)),
 ) (Allocator.Error || Shard.AttachError || std.Thread.SpawnError)!void {
+    const MaybeErr = comptime EntryReturnErrorSet(@TypeOf(function));
+    return self.startInternal(function, extra_args, if (MaybeErr != null) null else {});
+}
+
+fn startInternal(
+    self: *Runtime,
+    comptime function: anytype,
+    extra_args: ExtraArgsTuple(@TypeOf(function)),
+    err_capture: if (EntryReturnErrorSet(@TypeOf(function))) |E| ?*ErrorCapture(E) else void,
+) (Allocator.Error || Shard.AttachError || std.Thread.SpawnError)!void {
     if (self.state != .initialized) {
         @panic("islet.Runtime.start: Runtime can only be started once");
     }
@@ -259,8 +271,7 @@ pub fn start(
     const Runner = struct {
         rt: *Runtime,
         extra: Extra,
-        err_lock: Io.Mutex = .init,
-        first_err: if (MaybeErr) |E| ?E else void = if (MaybeErr != null) null else {},
+        err_capture: if (MaybeErr) |E| ?*ErrorCapture(E) else void,
 
         fn cleanup(gpa: Allocator, raw: *anyopaque) void {
             const r: *@This() = @ptrCast(@alignCast(raw));
@@ -306,9 +317,11 @@ pub fn start(
 
             if (MaybeErr != null) {
                 @call(.auto, function, full_args) catch |err| {
-                    r.err_lock.lockUncancelable(kio);
-                    if (r.first_err == null) r.first_err = err;
-                    r.err_lock.unlock(kio);
+                    if (r.err_capture) |cap| {
+                        cap.lock.lockUncancelable(kio);
+                        if (cap.first_err == null) cap.first_err = err;
+                        cap.lock.unlock(kio);
+                    }
                     rt.requestStop();
                 };
             } else {
@@ -321,8 +334,8 @@ pub fn start(
     runner.* = .{
         .rt = self,
         .extra = extra_args,
+        .err_capture = err_capture,
     };
-    errdefer self.gpa.destroy(runner);
 
     self.active_runner_ctx = runner;
     self.cleanup_runner_fn = Runner.cleanup;
@@ -341,11 +354,7 @@ pub fn start(
             self.barrier_failed = true;
             self.barrier_mutex.unlock(kio);
             self.barrier_cond.broadcast(kio);
-            for (self.threads[0..self.spawned_threads]) |t| t.join();
-            self.spawned_threads = 0;
-            self.state = .joined;
-            self.active_runner_ctx = null;
-            self.cleanup_runner_fn = null;
+            self.joinThreadsOnly();
             return err;
         };
         self.spawned_threads += 1;
@@ -361,8 +370,6 @@ pub fn start(
 
     if (failed) {
         self.joinThreadsOnly();
-        self.active_runner_ctx = null;
-        self.cleanup_runner_fn = null;
         return error.SystemResources;
     }
 }
@@ -382,33 +389,16 @@ pub fn run(
     comptime function: anytype,
     extra_args: ExtraArgsTuple(@TypeOf(function)),
 ) RunResult(@TypeOf(function)) {
-    const Fn = @TypeOf(function);
-    const MaybeErr = comptime EntryReturnErrorSet(Fn);
-    try self.start(function, extra_args);
-
-    // Peek `first_err` from `Runner` before releasing it.
     self.assertNotSelfJoin();
-    const raw_runner = self.active_runner_ctx.?;
-    self.joinThreadsOnly();
-
+    const MaybeErr = comptime EntryReturnErrorSet(@TypeOf(function));
     if (MaybeErr) |E| {
-        const Extra = ExtraArgsTuple(Fn);
-        const RunnerView = struct {
-            rt: *Runtime,
-            extra: Extra,
-            err_lock: Io.Mutex,
-            first_err: ?E,
-        };
-        const view: *RunnerView = @ptrCast(@alignCast(raw_runner));
-        const maybe_err = view.first_err;
-        self.cleanup_runner_fn.?(self.gpa, raw_runner);
-        self.active_runner_ctx = null;
-        self.cleanup_runner_fn = null;
-        if (maybe_err) |e| return e;
+        var capture: ErrorCapture(E) = .{};
+        try self.startInternal(function, extra_args, &capture);
+        self.joinThreadsOnly();
+        if (capture.first_err) |e| return e;
     } else {
-        self.cleanup_runner_fn.?(self.gpa, raw_runner);
-        self.active_runner_ctx = null;
-        self.cleanup_runner_fn = null;
+        try self.startInternal(function, extra_args, {});
+        self.joinThreadsOnly();
     }
 }
 
@@ -432,5 +422,10 @@ fn joinThreadsOnly(self: *Runtime) void {
     for (self.threads[0..self.spawned_threads]) |t| t.join();
     self.spawned_threads = 0;
     if (self.has_acceptor) self.acceptor.join();
+    if (self.active_runner_ctx) |ctx| {
+        self.cleanup_runner_fn.?(self.gpa, ctx);
+        self.active_runner_ctx = null;
+        self.cleanup_runner_fn = null;
+    }
     self.state = .joined;
 }

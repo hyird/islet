@@ -16,7 +16,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
 const cache_line = std.atomic.cache_line;
 
 pub const InitError = Allocator.Error || error{InvalidCapacity};
@@ -67,10 +66,6 @@ pub fn SpscRing(comptime T: type) type {
             self.* = undefined;
         }
 
-        pub fn capacity(self: *const Self) usize {
-            return self.slots.len;
-        }
-
         /// Producer thread only: attempts to enqueue `value` without blocking.
         /// Returns `.{ .full = value }` on backpressure so caller retains ownership.
         pub fn tryPush(self: *Self, value: T) PushResult {
@@ -117,8 +112,6 @@ test "SpscRing single-thread backpressure, wrap-around, and cleanup" {
     try std.testing.expectError(error.InvalidCapacity, SpscRing(u64).init(gpa, 3));
 
     var ring = try SpscRing(u64).init(gpa, 4);
-    var cleaned_sum: u64 = 0;
-    _ = &cleaned_sum;
 
     for (0..4) |i| {
         try std.testing.expectEqual(SpscRing(u64).PushResult.ok, ring.tryPush(i + 10));

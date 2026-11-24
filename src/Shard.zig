@@ -21,7 +21,6 @@ const File = Io.File;
 const Dir = Io.Dir;
 const Threaded = Io.Threaded;
 
-const time = @import("time.zig");
 const TimerHeap = @import("TimerHeap.zig");
 const Mailbox = @import("Mailbox.zig");
 const ResumeLane = Mailbox.ResumeLane;
@@ -121,22 +120,25 @@ pub const Task = struct {
     cancel_protection: CancelProtectionState = .{},
     cancel_hook: ?CancelHook = null,
 
+    start_fn: union {
+        none: void,
+        future: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        group: *const fn (context: *const anyopaque) void,
+    } = .{ .none = {} },
+
     // `Future` linkage & storage
     awaiter: ?*Task = null,
-    start_future: *const fn (context: *const anyopaque, result: *anyopaque) void = undefined,
     context_ptr: [*]u8 = undefined,
     context_alloc: ?[]u8 = null,
     context_align: Alignment = .@"1",
     result_ptr: [*]u8 = undefined,
-    result_len: usize = 0,
     result_alloc: ?[]u8 = null,
     result_align: Alignment = .@"1",
 
-    // `Group` intrusive doubly-linked list & closure
+    // `Group` intrusive doubly-linked list
     group_owner: ?*Io.Group = null,
     group_prev: ?*Task = null,
     group_next: ?*Task = null,
-    start_group: *const fn (context: *const anyopaque) void = undefined,
 
     pub fn shouldCancelNow(self: *const Task) bool {
         return self.cancel_requested and self.cancel_protection.effective() == .unblocked;
@@ -336,7 +338,7 @@ pub fn detachCurrentThread(self: *Shard) void {
     }
 
     self.timers.cancelAll();
-    _ = self.drainIncoming();
+    self.drainIncoming();
 
     self.idle_exit = true;
     fiber.switchContext(&self.thread_ctx.ctx, &self.idle_fiber.ctx);
@@ -531,46 +533,41 @@ pub fn suspendCurrent(self: *Shard) void {
     self.reclaimPendingFiber();
 }
 
+fn dispatchFromIdle(self: *Shard, next_task: *Task) void {
+    self.in_idle_fiber = false;
+    self.current_task = next_task;
+    fiber.switchContext(&self.idle_fiber.ctx, self.contextOfTask(next_task));
+    self.in_idle_fiber = true;
+    self.reclaimPendingFiber();
+}
+
 fn idleFiberEntry(arg: *anyopaque) void {
     const self: *Shard = @ptrCast(@alignCast(arg));
     self.in_idle_fiber = true;
     self.reclaimPendingFiber();
 
     while (!self.idle_exit) {
-        // Fast path: if ready tasks exist and we haven't exhausted `io_poll_cadence`,
-        // dispatch immediately without issuing redundant clock/poller syscalls!
-        if (self.hasReadyTasks() and self.steps_since_poll < io_poll_cadence) {
+        // Fast path: dispatch ready tasks within `io_poll_cadence` without clock/poller syscalls.
+        if (self.steps_since_poll < io_poll_cadence) {
             if (self.popNextReady()) |next_task| {
                 self.steps_since_poll += 1;
-                self.in_idle_fiber = false;
-                self.current_task = next_task;
-                fiber.switchContext(&self.idle_fiber.ctx, self.contextOfTask(next_task));
-                self.in_idle_fiber = true;
-                self.reclaimPendingFiber();
+                self.dispatchFromIdle(next_task);
                 continue;
             }
-        }
-
-        if (self.hasReadyTasks()) {
+        } else if (self.hasReadyTasks()) {
             // `io_poll_cadence` reached while CPU tasks remain ready: run nonblocking poll(0).
             self.steps_since_poll = 0;
-            _ = self.drainIncoming();
-            if (self.timers.hasActive()) {
-                _ = self.timers.fireExpired(self.awakeNowNs());
-            }
+            self.drainIncoming();
+            if (self.timers.hasActive()) _ = self.timers.fireExpired(self.awakeNowNs());
             _ = self.driver.poll(0);
             if (self.popNextReady()) |next_task| {
                 self.steps_since_poll = 1;
-                self.in_idle_fiber = false;
-                self.current_task = next_task;
-                fiber.switchContext(&self.idle_fiber.ctx, self.contextOfTask(next_task));
-                self.in_idle_fiber = true;
-                self.reclaimPendingFiber();
+                self.dispatchFromIdle(next_task);
                 continue;
             }
         }
 
-        _ = self.drainIncoming();
+        self.drainIncoming();
         var pre_poll_now: ?i96 = null;
         if (self.timers.hasActive()) {
             const now_ns = self.awakeNowNs();
@@ -580,11 +577,7 @@ fn idleFiberEntry(arg: *anyopaque) void {
 
         if (self.popNextReady()) |next_task| {
             self.steps_since_poll = 1;
-            self.in_idle_fiber = false;
-            self.current_task = next_task;
-            fiber.switchContext(&self.idle_fiber.ctx, self.contextOfTask(next_task));
-            self.in_idle_fiber = true;
-            self.reclaimPendingFiber();
+            self.dispatchFromIdle(next_task);
             continue;
         }
 
@@ -595,12 +588,11 @@ fn idleFiberEntry(arg: *anyopaque) void {
         self.driver.armDoorbell();
         if (!self.allIncomingEmptySeqCst()) {
             self.driver.disarmDoorbell();
-            _ = self.drainIncoming();
             continue;
         }
 
         const wait_ns: ?i96 = if (self.timers.peekDeadlineNs()) |dl|
-            time.subNsSat(dl, pre_poll_now orelse self.awakeNowNs())
+            dl -| (pre_poll_now orelse self.awakeNowNs())
         else
             null;
 
@@ -608,18 +600,11 @@ fn idleFiberEntry(arg: *anyopaque) void {
         _ = self.driver.poll(wait_ns);
         self.driver.disarmDoorbell();
 
-        _ = self.drainIncoming();
-        if (self.timers.hasActive()) {
-            _ = self.timers.fireExpired(self.awakeNowNs());
-        }
-
+        self.drainIncoming();
+        if (self.timers.hasActive()) _ = self.timers.fireExpired(self.awakeNowNs());
         if (self.popNextReady()) |next_task| {
             self.steps_since_poll = 1;
-            self.in_idle_fiber = false;
-            self.current_task = next_task;
-            fiber.switchContext(&self.idle_fiber.ctx, self.contextOfTask(next_task));
-            self.in_idle_fiber = true;
-            self.reclaimPendingFiber();
+            self.dispatchFromIdle(next_task);
         }
     }
     self.in_idle_fiber = false;
@@ -635,14 +620,12 @@ fn allIncomingEmptySeqCst(self: *const Shard) bool {
     return true;
 }
 
-pub fn drainIncoming(self: *Shard) usize {
-    var drained: usize = 0;
-    drained += self.resume_lane.drain();
+pub fn drainIncoming(self: *Shard) void {
+    _ = self.resume_lane.drain();
     if (self.mesh) |m| {
-        drained += m.drainFor(self.id, self, onMeshFutexWake);
+        _ = m.drainFor(self.id, self, onMeshFutexWake);
     }
-    drained += self.driver.drainAcceptor();
-    return drained;
+    self.driver.drainAcceptor();
 }
 
 fn onMeshFutexWake(ctx: ?*anyopaque, waiter: *FutexTable.Waiter) void {
@@ -754,7 +737,6 @@ fn spawnTaskFiber(
         .context_alloc = context_alloc,
         .context_align = context_alignment,
         .result_ptr = result_ptr,
-        .result_len = result_len,
         .result_alloc = result_alloc,
         .result_align = result_alignment,
     };
@@ -785,13 +767,18 @@ fn taskFiberEntry(arg: *anyopaque) void {
 
     switch (task.kind) {
         .main => unreachable,
+        .future => task.start_fn.future(task.context_ptr, task.result_ptr),
+        .group => task.start_fn.group(task.context_ptr),
+    }
+    if (task.context_alloc) |ctx_slice| {
+        self.gpa.rawFree(ctx_slice, task.context_align, @returnAddress());
+        task.context_alloc = null;
+    }
+    task.finished = true;
+
+    switch (task.kind) {
+        .main => unreachable,
         .future => {
-            task.start_future(task.context_ptr, task.result_ptr);
-            if (task.context_alloc) |ctx_slice| {
-                self.gpa.rawFree(ctx_slice, task.context_align, @returnAddress());
-                task.context_alloc = null;
-            }
-            task.finished = true;
             if (task.awaiter) |awaiter| {
                 task.awaiter = null;
                 self.enqueueReady(awaiter);
@@ -800,12 +787,6 @@ fn taskFiberEntry(arg: *anyopaque) void {
             task.raw.?.exit_target = self.selectExitTarget();
         },
         .group => {
-            task.start_group(task.context_ptr);
-            if (task.context_alloc) |ctx_slice| {
-                self.gpa.rawFree(ctx_slice, task.context_align, @returnAddress());
-                task.context_alloc = null;
-            }
-            task.finished = true;
             self.unlinkGroupTask(task);
             assert(self.active_tasks > 0);
             self.active_tasks -= 1;
@@ -860,7 +841,7 @@ fn vtableConcurrent(
 ) Io.ConcurrentError!*Io.AnyFuture {
     const self = fromUserdata(userdata);
     const task = try self.spawnTaskFiber(.future, result_len, result_alignment, context, context_alignment);
-    task.start_future = start;
+    task.start_fn = .{ .future = start };
     self.active_tasks += 1;
     self.enqueueReady(task);
     return @ptrCast(task);
@@ -1040,7 +1021,7 @@ fn vtableGroupConcurrent(
 ) Io.ConcurrentError!void {
     const self = fromUserdata(userdata);
     const task = try self.spawnTaskFiber(.group, 0, .@"1", context, context_alignment);
-    task.start_group = start;
+    task.start_fn = .{ .group = start };
     linkGroupTask(group, task);
     self.active_tasks += 1;
     self.enqueueReady(task);
@@ -1125,11 +1106,15 @@ fn vtableClockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Resolu
     return self.driver.clockResolution(clock);
 }
 
+inline fn resolveDeadlineNs(self: *Shard, timeout: Io.Timeout) ?i96 {
+    return TimerHeap.resolveAwakeDeadlineNs(timeout, self, vtableNow);
+}
+
 fn vtableSleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
 
-    const maybe_deadline = time.resolveAwakeDeadlineNs(timeout, self, vtableNow);
+    const maybe_deadline = self.resolveDeadlineNs(timeout);
     if (maybe_deadline) |dl| {
         if (dl <= self.awakeNowNs()) return;
     }
@@ -1276,7 +1261,7 @@ fn futexWaitInternal(
 
     if (@atomicLoad(u32, ptr, .acquire) != expected) return;
 
-    const maybe_dl = time.resolveAwakeDeadlineNs(timeout, self, vtableNow);
+    const maybe_dl = self.resolveDeadlineNs(timeout);
     if (maybe_dl) |dl| {
         if (dl <= self.awakeNowNs()) return;
     }
@@ -1510,7 +1495,7 @@ fn vtableBatchAwaitConcurrent(
 }
 
 fn waitBatchCompletion(self: *Shard, batch: *Io.Batch, timeout: Io.Timeout) (Io.Cancelable || Io.Timeout.Error)!void {
-    const maybe_dl = time.resolveAwakeDeadlineNs(timeout, self, vtableNow);
+    const maybe_dl = self.resolveDeadlineNs(timeout);
     if (maybe_dl) |dl| {
         if (dl <= self.awakeNowNs()) return error.Timeout;
     }
@@ -1725,20 +1710,25 @@ fn vtableUnlockStderr(userdata: ?*anyopaque) void {
 
 // ── VTable: `Dir` & `File` & `MemoryMap` & `Process` Delegation ──────────────
 
-fn forwardThreaded(comptime field: []const u8, comptime cancelable: bool) @FieldType(Io.VTable, field) {
+const ForwardMode = enum {
+    pool,
+    pool_uncancelable,
+    inline_fast,
+    inline_uncancelable,
+};
+
+fn forwardThreaded(comptime field: []const u8, comptime mode: ForwardMode) @FieldType(Io.VTable, field) {
     const FnType = @typeInfo(@FieldType(Io.VTable, field)).pointer.child;
     const fn_info = @typeInfo(FnType).@"fn";
     const Ret = fn_info.return_type.?;
+    const cancelable = (mode == .pool or mode == .inline_fast);
+    const use_pool = (mode == .pool or mode == .pool_uncancelable);
+    const can_cancel = comptime cancelable and switch (@typeInfo(Ret)) {
+        .error_union => |eu| (eu.error_set || error{Canceled}) == eu.error_set,
+        else => false,
+    };
 
     return &struct {
-        fn buildExtraTuple(all_args: std.meta.ArgsTuple(FnType)) ExtraTupleType() {
-            var extra: ExtraTupleType() = undefined;
-            inline for (1..fn_info.param_types.len) |i| {
-                extra[i - 1] = all_args[i];
-            }
-            return extra;
-        }
-
         fn ExtraTupleType() type {
             var types: [fn_info.param_types.len - 1]type = undefined;
             for (1..fn_info.param_types.len) |i| {
@@ -1752,87 +1742,47 @@ fn forwardThreaded(comptime field: []const u8, comptime cancelable: bool) @Field
             return @call(.auto, @field(t_io.vtable, field), .{t_io.userdata} ++ extra);
         }
 
+        fn invoke(userdata: ?*anyopaque, extra: ExtraTupleType()) Ret {
+            const self = fromUserdata(userdata);
+            if (comptime use_pool) {
+                return self.callBlocking(cancelable, runOnThreaded, .{extra});
+            }
+            if (comptime can_cancel) try self.checkCancelPoint();
+            return runOnThreaded(&self.blocking_pool.threaded, extra);
+        }
+
         const impl = switch (fn_info.param_types.len) {
             1 => struct {
                 fn call(p0: fn_info.param_types[0].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{p0})});
+                    return invoke(p0, .{});
                 }
             }.call,
             2 => struct {
                 fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{ p0, p1 })});
+                    return invoke(p0, .{p1});
                 }
             }.call,
             3 => struct {
                 fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{ p0, p1, p2 })});
+                    return invoke(p0, .{ p1, p2 });
                 }
             }.call,
             4 => struct {
                 fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?, p3: fn_info.param_types[3].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{ p0, p1, p2, p3 })});
+                    return invoke(p0, .{ p1, p2, p3 });
                 }
             }.call,
             5 => struct {
                 fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?, p3: fn_info.param_types[3].?, p4: fn_info.param_types[4].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{ p0, p1, p2, p3, p4 })});
+                    return invoke(p0, .{ p1, p2, p3, p4 });
                 }
             }.call,
             6 => struct {
                 fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?, p3: fn_info.param_types[3].?, p4: fn_info.param_types[4].?, p5: fn_info.param_types[5].?) Ret {
-                    const self = fromUserdata(p0);
-                    return self.callBlocking(cancelable, runOnThreaded, .{buildExtraTuple(.{ p0, p1, p2, p3, p4, p5 })});
+                    return invoke(p0, .{ p1, p2, p3, p4, p5 });
                 }
             }.call,
             else => @compileError("unexpected VTable arity"),
-        };
-    }.impl;
-}
-
-/// Inline zero-hop forwarder for pure in-RAM kernel descriptor, handle-flag, or PEB
-/// operations (`lseek`, `flock(LOCK_NB/LOCK_UN)`, `getcwd`, `FD_CLOEXEC`) that never
-/// block on disk or network I/O.
-fn forwardThreadedInline(comptime field: []const u8, comptime cancelable: bool) @FieldType(Io.VTable, field) {
-    const FnType = @typeInfo(@FieldType(Io.VTable, field)).pointer.child;
-    const fn_info = @typeInfo(FnType).@"fn";
-    const Ret = fn_info.return_type.?;
-    const can_cancel = comptime cancelable and switch (@typeInfo(Ret)) {
-        .error_union => |eu| (eu.error_set || error{Canceled}) == eu.error_set,
-        else => false,
-    };
-
-    return &struct {
-        const impl = switch (fn_info.param_types.len) {
-            1 => struct {
-                fn call(p0: fn_info.param_types[0].?) Ret {
-                    const self = fromUserdata(p0);
-                    if (can_cancel) try self.checkCancelPoint();
-                    const t_io = self.blocking_pool.threaded.io();
-                    return @field(t_io.vtable, field)(t_io.userdata);
-                }
-            }.call,
-            2 => struct {
-                fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?) Ret {
-                    const self = fromUserdata(p0);
-                    if (can_cancel) try self.checkCancelPoint();
-                    const t_io = self.blocking_pool.threaded.io();
-                    return @field(t_io.vtable, field)(t_io.userdata, p1);
-                }
-            }.call,
-            3 => struct {
-                fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?) Ret {
-                    const self = fromUserdata(p0);
-                    if (can_cancel) try self.checkCancelPoint();
-                    const t_io = self.blocking_pool.threaded.io();
-                    return @field(t_io.vtable, field)(t_io.userdata, p1, p2);
-                }
-            }.call,
-            else => @compileError("unexpected inline VTable arity"),
         };
     }.impl;
 }
@@ -1933,7 +1883,7 @@ fn vtableNetConnectIp(
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
 
-    const maybe_dl = time.resolveAwakeDeadlineNs(options.timeout, self, vtableNow);
+    const maybe_dl = self.resolveDeadlineNs(options.timeout);
     if (maybe_dl) |dl| {
         if (dl <= self.awakeNowNs()) return error.Timeout;
     }
@@ -2026,28 +1976,15 @@ fn vtableNetLookup(
     try self.checkCancelPoint();
 
     const name = host_name.bytes;
-    if (net.IpAddress.parseIp6(name, options.port)) |addr| {
+    const parsed_literal: ?net.IpAddress = if (net.IpAddress.parseIp6(name, options.port)) |addr| blk: {
         if (options.family == .ip4) return error.UnknownHostName;
-        if (options.canonical_name_buffer) |cbuf| {
-            @memcpy(cbuf[0..name.len], name);
-            resolved.putAll(shard_io, &.{
-                .{ .address = addr },
-                .{ .canonical_name = .{ .bytes = cbuf[0..name.len] } },
-            }) catch |err| switch (err) {
-                error.Closed => unreachable,
-                error.Canceled => return error.Canceled,
-            };
-        } else {
-            resolved.putOne(shard_io, .{ .address = addr }) catch |err| switch (err) {
-                error.Closed => unreachable,
-                error.Canceled => return error.Canceled,
-            };
-        }
-        return;
-    } else |_| {}
-
-    if (net.IpAddress.parseIp4(name, options.port)) |addr| {
+        break :blk addr;
+    } else |_| if (net.IpAddress.parseIp4(name, options.port)) |addr| blk: {
         if (options.family == .ip6) return error.UnknownHostName;
+        break :blk addr;
+    } else |_| null;
+
+    if (parsed_literal) |addr| {
         if (options.canonical_name_buffer) |cbuf| {
             @memcpy(cbuf[0..name.len], name);
             resolved.putAll(shard_io, &.{
@@ -2064,7 +2001,7 @@ fn vtableNetLookup(
             };
         }
         return;
-    } else |_| {}
+    }
 
     const lo_suffix = if (name[name.len - 1] == '.') "localhost." else "localhost";
     if (std.ascii.endsWithIgnoreCase(name, lo_suffix) and
@@ -2155,79 +2092,79 @@ const vtable: Io.VTable = .{
     .batchAwaitConcurrent = vtableBatchAwaitConcurrent,
     .batchCancel = vtableBatchCancel,
 
-    .dirCreateDir = forwardThreaded("dirCreateDir", true),
-    .dirCreateDirPath = forwardThreaded("dirCreateDirPath", true),
-    .dirCreateDirPathOpen = forwardThreaded("dirCreateDirPathOpen", true),
-    .dirOpenDir = forwardThreaded("dirOpenDir", true),
-    .dirStat = forwardThreaded("dirStat", true),
-    .dirStatFile = forwardThreaded("dirStatFile", true),
-    .dirAccess = forwardThreaded("dirAccess", true),
-    .dirCreateFile = forwardThreaded("dirCreateFile", true),
-    .dirCreateFileAtomic = forwardThreaded("dirCreateFileAtomic", true),
-    .dirOpenFile = forwardThreaded("dirOpenFile", true),
+    .dirCreateDir = forwardThreaded("dirCreateDir", .pool),
+    .dirCreateDirPath = forwardThreaded("dirCreateDirPath", .pool),
+    .dirCreateDirPathOpen = forwardThreaded("dirCreateDirPathOpen", .pool),
+    .dirOpenDir = forwardThreaded("dirOpenDir", .pool),
+    .dirStat = forwardThreaded("dirStat", .pool),
+    .dirStatFile = forwardThreaded("dirStatFile", .pool),
+    .dirAccess = forwardThreaded("dirAccess", .pool),
+    .dirCreateFile = forwardThreaded("dirCreateFile", .pool),
+    .dirCreateFileAtomic = forwardThreaded("dirCreateFileAtomic", .pool),
+    .dirOpenFile = forwardThreaded("dirOpenFile", .pool),
     .dirClose = vtableDirClose,
-    .dirRead = forwardThreaded("dirRead", true),
-    .dirRealPath = forwardThreaded("dirRealPath", true),
-    .dirRealPathFile = forwardThreaded("dirRealPathFile", true),
-    .dirDeleteFile = forwardThreaded("dirDeleteFile", true),
-    .dirDeleteDir = forwardThreaded("dirDeleteDir", true),
-    .dirRename = forwardThreaded("dirRename", true),
-    .dirRenamePreserve = forwardThreaded("dirRenamePreserve", true),
-    .dirSymLink = forwardThreaded("dirSymLink", true),
-    .dirReadLink = forwardThreaded("dirReadLink", true),
-    .dirSetOwner = forwardThreaded("dirSetOwner", true),
-    .dirSetFileOwner = forwardThreaded("dirSetFileOwner", true),
-    .dirSetPermissions = forwardThreaded("dirSetPermissions", true),
-    .dirSetFilePermissions = forwardThreaded("dirSetFilePermissions", true),
-    .dirSetTimestamps = forwardThreaded("dirSetTimestamps", true),
-    .dirHardLink = forwardThreaded("dirHardLink", true),
+    .dirRead = forwardThreaded("dirRead", .pool),
+    .dirRealPath = forwardThreaded("dirRealPath", .pool),
+    .dirRealPathFile = forwardThreaded("dirRealPathFile", .pool),
+    .dirDeleteFile = forwardThreaded("dirDeleteFile", .pool),
+    .dirDeleteDir = forwardThreaded("dirDeleteDir", .pool),
+    .dirRename = forwardThreaded("dirRename", .pool),
+    .dirRenamePreserve = forwardThreaded("dirRenamePreserve", .pool),
+    .dirSymLink = forwardThreaded("dirSymLink", .pool),
+    .dirReadLink = forwardThreaded("dirReadLink", .pool),
+    .dirSetOwner = forwardThreaded("dirSetOwner", .pool),
+    .dirSetFileOwner = forwardThreaded("dirSetFileOwner", .pool),
+    .dirSetPermissions = forwardThreaded("dirSetPermissions", .pool),
+    .dirSetFilePermissions = forwardThreaded("dirSetFilePermissions", .pool),
+    .dirSetTimestamps = forwardThreaded("dirSetTimestamps", .pool),
+    .dirHardLink = forwardThreaded("dirHardLink", .pool),
 
-    .fileStat = forwardThreaded("fileStat", true),
-    .fileLength = forwardThreaded("fileLength", true),
+    .fileStat = forwardThreaded("fileStat", .pool),
+    .fileLength = forwardThreaded("fileLength", .pool),
     .fileClose = vtableFileClose,
-    .fileWritePositional = forwardThreaded("fileWritePositional", true),
+    .fileWritePositional = forwardThreaded("fileWritePositional", .pool),
     .fileWriteFileStreaming = vtableFileWriteFileStreaming,
     .fileWriteFilePositional = vtableFileWriteFilePositional,
-    .fileReadPositional = forwardThreaded("fileReadPositional", true),
-    .fileSeekBy = forwardThreadedInline("fileSeekBy", true),
-    .fileSeekTo = forwardThreadedInline("fileSeekTo", true),
-    .fileSync = forwardThreaded("fileSync", true),
-    .fileIsTty = forwardThreaded("fileIsTty", true),
-    .fileEnableAnsiEscapeCodes = forwardThreaded("fileEnableAnsiEscapeCodes", true),
-    .fileSupportsAnsiEscapeCodes = forwardThreaded("fileSupportsAnsiEscapeCodes", true),
-    .fileSetLength = forwardThreaded("fileSetLength", true),
-    .fileSetOwner = forwardThreaded("fileSetOwner", true),
-    .fileSetPermissions = forwardThreaded("fileSetPermissions", true),
-    .fileSetTimestamps = forwardThreaded("fileSetTimestamps", true),
-    .fileLock = forwardThreaded("fileLock", true),
-    .fileTryLock = forwardThreadedInline("fileTryLock", true),
-    .fileUnlock = forwardThreadedInline("fileUnlock", false),
-    .fileDowngradeLock = forwardThreaded("fileDowngradeLock", true),
-    .fileRealPath = forwardThreaded("fileRealPath", true),
-    .fileHardLink = forwardThreaded("fileHardLink", true),
+    .fileReadPositional = forwardThreaded("fileReadPositional", .pool),
+    .fileSeekBy = forwardThreaded("fileSeekBy", .inline_fast),
+    .fileSeekTo = forwardThreaded("fileSeekTo", .inline_fast),
+    .fileSync = forwardThreaded("fileSync", .pool),
+    .fileIsTty = forwardThreaded("fileIsTty", .pool),
+    .fileEnableAnsiEscapeCodes = forwardThreaded("fileEnableAnsiEscapeCodes", .pool),
+    .fileSupportsAnsiEscapeCodes = forwardThreaded("fileSupportsAnsiEscapeCodes", .pool),
+    .fileSetLength = forwardThreaded("fileSetLength", .pool),
+    .fileSetOwner = forwardThreaded("fileSetOwner", .pool),
+    .fileSetPermissions = forwardThreaded("fileSetPermissions", .pool),
+    .fileSetTimestamps = forwardThreaded("fileSetTimestamps", .pool),
+    .fileLock = forwardThreaded("fileLock", .pool),
+    .fileTryLock = forwardThreaded("fileTryLock", .inline_fast),
+    .fileUnlock = forwardThreaded("fileUnlock", .inline_uncancelable),
+    .fileDowngradeLock = forwardThreaded("fileDowngradeLock", .pool),
+    .fileRealPath = forwardThreaded("fileRealPath", .pool),
+    .fileHardLink = forwardThreaded("fileHardLink", .pool),
 
-    .fileMemoryMapCreate = forwardThreaded("fileMemoryMapCreate", true),
-    .fileMemoryMapDestroy = forwardThreaded("fileMemoryMapDestroy", false),
-    .fileMemoryMapSetLength = forwardThreaded("fileMemoryMapSetLength", true),
-    .fileMemoryMapRead = forwardThreaded("fileMemoryMapRead", true),
-    .fileMemoryMapWrite = forwardThreaded("fileMemoryMapWrite", true),
+    .fileMemoryMapCreate = forwardThreaded("fileMemoryMapCreate", .pool),
+    .fileMemoryMapDestroy = forwardThreaded("fileMemoryMapDestroy", .pool_uncancelable),
+    .fileMemoryMapSetLength = forwardThreaded("fileMemoryMapSetLength", .pool),
+    .fileMemoryMapRead = forwardThreaded("fileMemoryMapRead", .pool),
+    .fileMemoryMapWrite = forwardThreaded("fileMemoryMapWrite", .pool),
 
-    .processExecutableOpen = forwardThreaded("processExecutableOpen", true),
-    .processExecutablePath = forwardThreaded("processExecutablePath", true),
+    .processExecutableOpen = forwardThreaded("processExecutableOpen", .pool),
+    .processExecutablePath = forwardThreaded("processExecutablePath", .pool),
     .lockStderr = vtableLockStderr,
     .tryLockStderr = vtableTryLockStderr,
     .unlockStderr = vtableUnlockStderr,
-    .processCurrentPath = forwardThreadedInline("processCurrentPath", true),
-    .processSetCurrentDir = forwardThreaded("processSetCurrentDir", true),
-    .processSetCurrentPath = forwardThreaded("processSetCurrentPath", true),
-    .processReplace = forwardThreaded("processReplace", true),
+    .processCurrentPath = forwardThreaded("processCurrentPath", .inline_fast),
+    .processSetCurrentDir = forwardThreaded("processSetCurrentDir", .pool),
+    .processSetCurrentPath = forwardThreaded("processSetCurrentPath", .pool),
+    .processReplace = forwardThreaded("processReplace", .pool),
     .processSpawn = vtableProcessSpawn,
     .childWait = vtableChildWait,
     .childKill = vtableChildKill,
 
-    .progressParentFile = forwardThreadedInline("progressParentFile", true),
-    .inheritParentDir = forwardThreadedInline("inheritParentDir", true),
-    .inheritParentFile = forwardThreadedInline("inheritParentFile", true),
+    .progressParentFile = forwardThreaded("progressParentFile", .inline_fast),
+    .inheritParentDir = forwardThreaded("inheritParentDir", .inline_fast),
+    .inheritParentFile = forwardThreaded("inheritParentFile", .inline_fast),
 
     .now = vtableNow,
     .clockResolution = vtableClockResolution,

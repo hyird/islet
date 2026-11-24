@@ -10,10 +10,48 @@
 //!   `cancel()` — zero stale heap bloat and zero O(N) compaction scans.
 
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const TimerHeap = @This();
+
+/// Maximum finite millisecond timeout accepted by `epoll_wait` (`i32` >= 0)
+/// and safely below Windows `INFINITE` (`0xFFFFFFFF`).
+pub const max_wait_ms: u31 = std.math.maxInt(i32);
+
+/// Converts a remaining nanosecond duration into an `epoll_wait` / `IOCP`
+/// millisecond wait budget using ceiling rounding (`ceil`).
+///
+/// - `<= 0` returns `0` (non-blocking poll).
+/// - `(0, 1ms]` returns `1` (never truncates positive sub-millisecond waits to 0).
+/// - Clamps values above `max_wait_ms` to `max_wait_ms`.
+pub fn ceilWaitMs(remaining_ns: i96) u31 {
+    if (remaining_ns <= 0) return 0;
+    const ns_per_ms: i96 = std.time.ns_per_ms;
+    const rounded = @divTrunc(remaining_ns - 1, ns_per_ms) +| 1;
+    if (rounded >= max_wait_ms) return max_wait_ms;
+    return @intCast(rounded);
+}
+
+/// Resolves an `Io.Timeout` into an optional target nanosecond deadline on the
+/// monotonic `.awake` clock, using `now_fn` to query clocks when needed.
+pub fn resolveAwakeDeadlineNs(
+    timeout: Io.Timeout,
+    userdata: ?*anyopaque,
+    now_fn: *const fn (?*anyopaque, Io.Clock) Io.Timestamp,
+) ?i96 {
+    return switch (timeout) {
+        .none => null,
+        .duration => |dur| now_fn(userdata, .awake).nanoseconds +| dur.raw.nanoseconds,
+        .deadline => |dl| blk: {
+            if (dl.clock == .awake) break :blk dl.raw.nanoseconds;
+            const clock_now = now_fn(userdata, dl.clock).nanoseconds;
+            const awake_now = now_fn(userdata, .awake).nanoseconds;
+            break :blk awake_now +| (dl.raw.nanoseconds -| clock_now);
+        },
+    };
+}
 
 const heap_arity = 4;
 
@@ -352,4 +390,14 @@ test "TimerHeap 4-ary heap orders deadlines, removes interior cancellations in-p
     rec.len = 0;
     try std.testing.expectEqual(@as(usize, 16), heap.fireExpired(500));
     try std.testing.expect(!heap.hasActive());
+}
+
+test "ceilWaitMs never truncates positive sub-millisecond durations to zero" {
+    try std.testing.expectEqual(@as(u31, 0), ceilWaitMs(-100));
+    try std.testing.expectEqual(@as(u31, 0), ceilWaitMs(0));
+    try std.testing.expectEqual(@as(u31, 1), ceilWaitMs(1));
+    try std.testing.expectEqual(@as(u31, 1), ceilWaitMs(std.time.ns_per_ms - 1));
+    try std.testing.expectEqual(@as(u31, 1), ceilWaitMs(std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(u31, 2), ceilWaitMs(std.time.ns_per_ms + 1));
+    try std.testing.expectEqual(max_wait_ms, ceilWaitMs(std.math.maxInt(i96)));
 }

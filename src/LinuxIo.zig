@@ -27,7 +27,6 @@ const Mailbox = @import("Mailbox.zig");
 const ResumeLane = Mailbox.ResumeLane;
 const TimerHeap = @import("TimerHeap.zig");
 const Acceptor = @import("Acceptor.zig").Acceptor;
-const time = @import("time.zig");
 
 const LinuxIo = @This();
 
@@ -150,9 +149,7 @@ pub inline fn isAcceptorEmptySeqCst(_: *const LinuxIo) bool {
     return true;
 }
 
-pub inline fn drainAcceptor(_: *LinuxIo) usize {
-    return 0;
-}
+pub inline fn drainAcceptor(_: *LinuxIo) void {}
 
 pub inline fn onStopRequested(_: *LinuxIo) void {}
 
@@ -162,7 +159,7 @@ pub fn poll(self: *LinuxIo, wait_ns: ?i96) usize {
     defer tls_active_driver = prev;
 
     const timeout_ms: i32 = if (wait_ns) |ns|
-        @intCast(time.ceilWaitMs(ns))
+        @intCast(TimerHeap.ceilWaitMs(ns))
     else
         -1;
     return self.poller.poll(timeout_ms);
@@ -368,6 +365,52 @@ fn execCopyFileRange(_: *Threaded, args: CopyRangeArgs) File.WriteFilePositional
     }
 }
 
+const SendfileRange = struct {
+    has_in_off: bool,
+    in_off: linux.off_t,
+    count: usize,
+};
+
+const SendfileRangeError = error{
+    Canceled,
+    Unimplemented,
+    EndOfStream,
+    ReadFailed,
+};
+
+fn resolveSendfileRange(file_reader: *File.Reader, limit: Io.Limit) SendfileRangeError!SendfileRange {
+    if (@backingInt(limit) == 0) return .{ .has_in_off = false, .in_off = 0, .count = 0 };
+    if (file_reader.size) |size| {
+        if (size - file_reader.pos == 0) return error.EndOfStream;
+    }
+    const max_count: usize = 0x7ffff000;
+    return switch (file_reader.mode) {
+        .positional => {
+            const size = file_reader.getSize() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unimplemented,
+            };
+            if (size <= file_reader.pos) {
+                file_reader.size = file_reader.pos;
+                return error.EndOfStream;
+            }
+            const in_off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
+            return .{
+                .has_in_off = true,
+                .in_off = in_off,
+                .count = @min(@backingInt(limit), size - file_reader.pos, max_count),
+            };
+        },
+        .streaming => .{
+            .has_in_off = false,
+            .in_off = 0,
+            .count = @min(@backingInt(limit), max_count),
+        },
+        .positional_simple, .streaming_simple => error.Unimplemented,
+        .failure => error.ReadFailed,
+    };
+}
+
 pub fn fileWriteFileStreaming(
     self: *LinuxIo,
     shard: anytype,
@@ -378,35 +421,6 @@ pub fn fileWriteFileStreaming(
 ) File.Writer.WriteFileError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
     const reader_buffered = file_reader.interface.buffered();
-
-    if (reader_buffered.len >= @backingInt(limit)) {
-        const op_res = try self.operate(shard, .{ .file_write_streaming = .{
-            .file = file,
-            .header = header,
-            .data = &.{limit.slice(reader_buffered)},
-            .splat = 1,
-        } });
-        const n = try op_res.file_write_streaming;
-        file_reader.interface.toss(n -| header.len);
-        return n;
-    }
-
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) {
-            if (header.len != 0 or reader_buffered.len != 0) {
-                const op_res = try self.operate(shard, .{ .file_write_streaming = .{
-                    .file = file,
-                    .header = header,
-                    .data = &.{limit.slice(reader_buffered)},
-                    .splat = 1,
-                } });
-                const n = try op_res.file_write_streaming;
-                file_reader.interface.toss(n -| header.len);
-                return n;
-            }
-            return error.EndOfStream;
-        }
-    }
 
     if (header.len != 0 or reader_buffered.len != 0) {
         const op_res = try self.operate(shard, .{ .file_write_streaming = .{
@@ -420,30 +434,13 @@ pub fn fileWriteFileStreaming(
         return n;
     }
 
-    const max_count: usize = 0x7ffff000;
-    var in_off: linux.off_t = 0;
-    const has_in_off: bool, const count: usize = switch (file_reader.mode) {
-        .positional => blk: {
-            const size = file_reader.getSize() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => return error.Unimplemented,
-            };
-            if (size <= file_reader.pos) {
-                file_reader.size = file_reader.pos;
-                return error.EndOfStream;
-            }
-            in_off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
-            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
-        },
-        .streaming => .{ false, @min(@backingInt(limit), max_count) },
-        .positional_simple, .streaming_simple => return error.Unimplemented,
-        .failure => return error.ReadFailed,
-    };
-    if (count == 0) return 0;
+    const range = try resolveSendfileRange(file_reader, limit);
+    if (range.count == 0) return 0;
+    var in_off = range.in_off;
 
     if (file.flags.nonblocking) {
         while (true) {
-            const rc = linux.sendfile(file.handle, file_reader.file.handle, if (has_in_off) &in_off else null, count);
+            const rc = linux.sendfile(file.handle, file_reader.file.handle, if (range.has_in_off) &in_off else null, range.count);
             switch (linux.errno(rc)) {
                 .SUCCESS => {
                     self.poller.cascadeNext(file.handle, .write);
@@ -473,12 +470,12 @@ pub fn fileWriteFileStreaming(
 
     const copied = shard.callBlocking(true, execCopyFileRange, .{CopyRangeArgs{
         .in_fd = file_reader.file.handle,
-        .has_in_off = has_in_off,
+        .has_in_off = range.has_in_off,
         .in_off = in_off,
         .out_fd = file.handle,
         .has_out_off = false,
         .out_off = 0,
-        .len = count,
+        .len = range.count,
     }}) catch |err| switch (err) {
         error.Unseekable => return error.Unimplemented,
         else => |e| return e,
@@ -517,40 +514,18 @@ pub fn fileWriteFilePositional(
         return n;
     }
 
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) return error.EndOfStream;
-    }
-
+    const range = try resolveSendfileRange(file_reader, limit);
+    if (range.count == 0) return 0;
     const out_off = std.math.cast(linux.off_t, offset) orelse return error.Unseekable;
-    const max_count: usize = 0x7ffff000;
-    var in_off: linux.off_t = 0;
-    const has_in_off: bool, const count: usize = switch (file_reader.mode) {
-        .positional => blk: {
-            const size = file_reader.getSize() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => return error.Unimplemented,
-            };
-            if (size <= file_reader.pos) {
-                file_reader.size = file_reader.pos;
-                return error.EndOfStream;
-            }
-            in_off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
-            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
-        },
-        .streaming => .{ false, @min(@backingInt(limit), max_count) },
-        .positional_simple, .streaming_simple => return error.Unimplemented,
-        .failure => return error.ReadFailed,
-    };
-    if (count == 0) return 0;
 
     const copied = try shard.callBlocking(true, execCopyFileRange, .{CopyRangeArgs{
         .in_fd = file_reader.file.handle,
-        .has_in_off = has_in_off,
-        .in_off = in_off,
+        .has_in_off = range.has_in_off,
+        .in_off = range.in_off,
         .out_fd = file.handle,
         .has_out_off = true,
         .out_off = out_off,
-        .len = count,
+        .len = range.count,
     }});
     if (copied == 0) {
         file_reader.size = file_reader.pos;
@@ -690,19 +665,24 @@ fn fillWriteIovecsPosix(
     return len;
 }
 
+fn fillReadIovecsPosix(iovecs: *[Threaded.max_iovecs_len]posix.iovec, data: []const []u8) usize {
+    var n_iov: usize = 0;
+    for (data) |buf| {
+        if (n_iov == iovecs.len) break;
+        if (buf.len > 0) {
+            iovecs[n_iov] = .{ .base = buf.ptr, .len = buf.len };
+            n_iov += 1;
+        }
+    }
+    return n_iov;
+}
+
 fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
     switch (op) {
         .file_read_streaming => |o| {
             if (!o.file.flags.nonblocking) return .needs_pool;
             var iovecs: [Threaded.max_iovecs_len]posix.iovec = undefined;
-            var n_iov: usize = 0;
-            for (o.data) |buf| {
-                if (n_iov == iovecs.len) break;
-                if (buf.len > 0) {
-                    iovecs[n_iov] = .{ .base = buf.ptr, .len = buf.len };
-                    n_iov += 1;
-                }
-            }
+            const n_iov = fillReadIovecsPosix(&iovecs, o.data);
             if (n_iov == 0) return .{ .done = .{ .file_read_streaming = 0 } };
             while (true) {
                 const rc = linux.readv(o.file.handle, &iovecs, @intCast(n_iov));
@@ -753,14 +733,7 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
         .device_io_control => return .needs_pool,
         .net_read => |o| {
             var iovecs: [Threaded.max_iovecs_len]posix.iovec = undefined;
-            var n_iov: usize = 0;
-            for (o.data) |buf| {
-                if (n_iov == iovecs.len) break;
-                if (buf.len > 0) {
-                    iovecs[n_iov] = .{ .base = buf.ptr, .len = buf.len };
-                    n_iov += 1;
-                }
-            }
+            const n_iov = fillReadIovecsPosix(&iovecs, o.data);
             if (n_iov == 0 and o.control.len == 0) {
                 return .{ .done = .{ .net_read = .{ .data_len = 0 } } };
             }
@@ -1010,6 +983,10 @@ fn blockingOperateOnThreaded(t: *Threaded, op: Io.Operation) Io.Operation.Result
     };
 }
 
+fn runBlockingOperate(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    return blockingOperateOnThreaded(t, op_arg);
+}
+
 pub fn operate(self: *LinuxIo, shard: anytype, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     try shard.checkCancelPoint();
 
@@ -1023,19 +1000,11 @@ pub fn operate(self: *LinuxIo, shard: anytype, operation: Io.Operation) Io.Cance
                 self.waitFd(shard, wb.fd, wb.dir, null) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
                     error.Timeout => unreachable,
-                    else => return try shard.callBlocking(true, struct {
-                        fn run(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-                            return blockingOperateOnThreaded(t, op_arg);
-                        }
-                    }.run, .{operation}),
+                    else => return shard.callBlocking(true, runBlockingOperate, .{operation}),
                 };
             },
             .needs_pool => {
-                return try shard.callBlocking(true, struct {
-                    fn run(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-                        return blockingOperateOnThreaded(t, op_arg);
-                    }
-                }.run, .{operation});
+                return shard.callBlocking(true, runBlockingOperate, .{operation});
             },
         }
     }
@@ -1571,35 +1540,48 @@ fn fillUnixSockaddr(ua: *const net.UnixAddress, sun: *posix.sockaddr.un) posix.s
     return offset + @as(posix.socklen_t, @intCast(ua.path.len)) + 1;
 }
 
-pub fn netListenIp(
-    _: *LinuxIo,
-    _: anytype,
+const OpenIpSocketError = posix.UnexpectedError || error{
+    AddressFamilyUnsupported,
+    ProtocolUnsupportedByAddressFamily,
+    SocketModeUnsupported,
+    ProtocolUnsupportedBySystem,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    AccessDenied,
+};
+
+fn openIpSocket(
     address: *const net.IpAddress,
-    options: net.IpAddress.ListenOptions,
-) net.IpAddress.ListenError!net.Socket {
+    sock_mode: net.Socket.Mode,
+    sock_protocol: ?net.Protocol,
+) OpenIpSocketError!linux.fd_t {
     const family = Threaded.posixAddressFamily(address);
-    const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
+    const mode, const protocol = try Threaded.posixSocketModeProtocol(family, sock_mode, sock_protocol);
     const sock_rc = linux.socket(family, mode | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, protocol);
-    const fd: linux.fd_t = switch (linux.errno(sock_rc)) {
+    return switch (linux.errno(sock_rc)) {
         .SUCCESS => @intCast(sock_rc),
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
-        .PROTOTYPE => return error.SocketModeUnsupported,
-        .INVAL => return error.ProtocolUnsupportedBySystem,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        else => |err| return posix.unexpectedErrno(err),
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .PROTONOSUPPORT => error.ProtocolUnsupportedByAddressFamily,
+        .PROTOTYPE => error.SocketModeUnsupported,
+        .INVAL => error.ProtocolUnsupportedBySystem,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOMEM, .NOBUFS => error.SystemResources,
+        .ACCES => error.AccessDenied,
+        else => |err| posix.unexpectedErrno(err),
     };
-    errdefer Threaded.closeFd(fd);
+}
 
-    if (options.reuse_address) {
-        const one: c_int = 1;
-        try setSockOpt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one));
-        try setSockOpt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
-    }
+const BindIpError = posix.UnexpectedError || error{
+    AddressInUse,
+    AddressUnavailable,
+    AccessDenied,
+    AddressFamilyUnsupported,
+    SystemResources,
+};
 
+fn bindIpSocket(fd: linux.fd_t, address: *const net.IpAddress) BindIpError!void {
     var storage: Threaded.PosixAddress = undefined;
     const addr_len = Threaded.addressToPosix(address, &storage);
     switch (linux.errno(linux.bind(fd, &storage.any, addr_len))) {
@@ -1611,6 +1593,36 @@ pub fn netListenIp(
         .NOMEM, .NOBUFS => return error.SystemResources,
         else => |err| return posix.unexpectedErrno(err),
     }
+}
+
+fn querySocketAddress(fd: linux.fd_t) posix.UnexpectedError!net.Socket {
+    var bound: Threaded.PosixAddress = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
+    switch (linux.errno(linux.getsockname(fd, &bound.any, &bound_len))) {
+        .SUCCESS => return .{
+            .handle = fd,
+            .address = Threaded.addressFromPosix(&bound),
+        },
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+pub fn netListenIp(
+    _: *LinuxIo,
+    _: anytype,
+    address: *const net.IpAddress,
+    options: net.IpAddress.ListenOptions,
+) net.IpAddress.ListenError!net.Socket {
+    const fd = try openIpSocket(address, options.mode, options.protocol);
+    errdefer Threaded.closeFd(fd);
+
+    if (options.reuse_address) {
+        const one: c_int = 1;
+        try setSockOpt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one));
+        try setSockOpt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&one));
+    }
+
+    try bindIpSocket(fd, address);
 
     switch (linux.errno(linux.listen(fd, options.kernel_backlog))) {
         .SUCCESS => {},
@@ -1620,16 +1632,7 @@ pub fn netListenIp(
         else => |err| return posix.unexpectedErrno(err),
     }
 
-    var bound: Threaded.PosixAddress = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-    switch (linux.errno(linux.getsockname(fd, &bound.any, &bound_len))) {
-        .SUCCESS => {},
-        else => |err| return posix.unexpectedErrno(err),
-    }
-    return .{
-        .handle = fd,
-        .address = Threaded.addressFromPosix(&bound),
-    };
+    return querySocketAddress(fd);
 }
 
 pub fn netAccept(
@@ -1701,21 +1704,7 @@ pub fn netBindIp(
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
-    const family = Threaded.posixAddressFamily(address);
-    const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
-    const sock_rc = linux.socket(family, mode | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, protocol);
-    const fd: linux.fd_t = switch (linux.errno(sock_rc)) {
-        .SUCCESS => @intCast(sock_rc),
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
-        .PROTOTYPE => return error.SocketModeUnsupported,
-        .INVAL => return error.ProtocolUnsupportedBySystem,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        else => |err| return posix.unexpectedErrno(err),
-    };
+    const fd = try openIpSocket(address, options.mode, options.protocol);
     errdefer Threaded.closeFd(fd);
 
     if (options.ip6_only) |v6only| {
@@ -1729,28 +1718,8 @@ pub fn netBindIp(
             return error.OptionUnsupported;
     }
 
-    var storage: Threaded.PosixAddress = undefined;
-    const addr_len = Threaded.addressToPosix(address, &storage);
-    switch (linux.errno(linux.bind(fd, &storage.any, addr_len))) {
-        .SUCCESS => {},
-        .ADDRINUSE => return error.AddressInUse,
-        .ADDRNOTAVAIL => return error.AddressUnavailable,
-        .ACCES => return error.AccessDenied,
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        else => |err| return posix.unexpectedErrno(err),
-    }
-
-    var bound: Threaded.PosixAddress = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-    switch (linux.errno(linux.getsockname(fd, &bound.any, &bound_len))) {
-        .SUCCESS => {},
-        else => |err| return posix.unexpectedErrno(err),
-    }
-    return .{
-        .handle = fd,
-        .address = Threaded.addressFromPosix(&bound),
-    };
+    try bindIpSocket(fd, address);
+    return querySocketAddress(fd);
 }
 
 pub fn netConnectIp(
@@ -1760,21 +1729,7 @@ pub fn netConnectIp(
     options: net.IpAddress.ConnectOptions,
     maybe_dl: ?i96,
 ) net.IpAddress.ConnectError!net.Socket {
-    const family = Threaded.posixAddressFamily(address);
-    const mode, const protocol = try Threaded.posixSocketModeProtocol(family, options.mode, options.protocol);
-    const sock_rc = linux.socket(family, mode | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, protocol);
-    const fd: linux.fd_t = switch (linux.errno(sock_rc)) {
-        .SUCCESS => @intCast(sock_rc),
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
-        .PROTOTYPE => return error.SocketModeUnsupported,
-        .INVAL => return error.ProtocolUnsupportedBySystem,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOMEM, .NOBUFS => return error.SystemResources,
-        .ACCES => return error.AccessDenied,
-        else => |err| return posix.unexpectedErrno(err),
-    };
+    const fd = try openIpSocket(address, options.mode, options.protocol);
     errdefer {
         self.poller.unregisterFd(fd);
         Threaded.closeFd(fd);
@@ -1807,13 +1762,7 @@ pub fn netConnectIp(
         }
     }
 
-    var local: Threaded.PosixAddress = undefined;
-    var local_len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-    _ = linux.getsockname(fd, &local.any, &local_len);
-    return .{
-        .handle = fd,
-        .address = Threaded.addressFromPosix(&local),
-    };
+    return querySocketAddress(fd);
 }
 
 pub fn netListenUnix(
@@ -1956,35 +1905,6 @@ pub fn netWriteFile(
     if (file_reader.mode == .failure) return error.ReadFailed;
     const reader_buffered = file_reader.interface.buffered();
 
-    if (reader_buffered.len >= @backingInt(limit)) {
-        const op_res = try self.operate(shard, .{ .net_write = .{
-            .socket_handle = socket_handle,
-            .header = header,
-            .data = &.{limit.slice(reader_buffered)},
-            .splat = 1,
-        } });
-        const n = try op_res.net_write;
-        file_reader.interface.toss(n -| header.len);
-        return n;
-    }
-
-    if (file_reader.size) |size| {
-        if (size - file_reader.pos == 0) {
-            if (header.len != 0 or reader_buffered.len != 0) {
-                const op_res = try self.operate(shard, .{ .net_write = .{
-                    .socket_handle = socket_handle,
-                    .header = header,
-                    .data = &.{limit.slice(reader_buffered)},
-                    .splat = 1,
-                } });
-                const n = try op_res.net_write;
-                file_reader.interface.toss(n -| header.len);
-                return n;
-            }
-            return error.EndOfStream;
-        }
-    }
-
     if (header.len != 0 or reader_buffered.len != 0) {
         const op_res = try self.operate(shard, .{ .net_write = .{
             .socket_handle = socket_handle,
@@ -1997,29 +1917,12 @@ pub fn netWriteFile(
         return n;
     }
 
-    const max_count: usize = 0x7ffff000;
-    var off: linux.off_t = 0;
-    const use_offset: bool, const count: usize = switch (file_reader.mode) {
-        .positional => blk: {
-            const size = file_reader.getSize() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => return error.Unimplemented,
-            };
-            if (size <= file_reader.pos) {
-                file_reader.size = file_reader.pos;
-                return error.EndOfStream;
-            }
-            off = std.math.cast(linux.off_t, file_reader.pos) orelse return error.ReadFailed;
-            break :blk .{ true, @min(@backingInt(limit), size - file_reader.pos, max_count) };
-        },
-        .streaming => .{ false, @min(@backingInt(limit), max_count) },
-        .positional_simple, .streaming_simple => return error.Unimplemented,
-        .failure => return error.ReadFailed,
-    };
-    if (count == 0) return 0;
+    const range = try resolveSendfileRange(file_reader, limit);
+    if (range.count == 0) return 0;
+    var off = range.in_off;
 
     while (true) {
-        const rc = linux.sendfile(socket_handle, file_reader.file.handle, if (use_offset) &off else null, count);
+        const rc = linux.sendfile(socket_handle, file_reader.file.handle, if (range.has_in_off) &off else null, range.count);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 self.poller.cascadeNext(socket_handle, .write);

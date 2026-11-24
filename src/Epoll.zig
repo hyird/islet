@@ -103,19 +103,15 @@ const WaitQueue = struct {
         w.next = null;
     }
 
-    fn wakeAll(self: *WaitQueue) usize {
-        var count: usize = 0;
+    fn wakeAll(self: *WaitQueue) void {
         while (self.popFront()) |w| {
-            count += 1;
             w.wake_fn(w);
         }
-        return count;
     }
 
-    fn wakeOne(self: *WaitQueue) bool {
-        const w = self.popFront() orelse return false;
+    fn wakeOne(self: *WaitQueue) void {
+        const w = self.popFront() orelse return;
         w.wake_fn(w);
-        return true;
     }
 };
 
@@ -262,10 +258,10 @@ pub fn cascadeNext(self: *Epoll, fd: linux.fd_t, dir: Direction) void {
     if (ufd >= self.slots.items.len) return;
     const slot = &self.slots.items[ufd];
     if (!slot.registered) return;
-    _ = switch (dir) {
+    switch (dir) {
         .read => slot.read_waiters.wakeOne(),
         .write => slot.write_waiters.wakeOne(),
-    };
+    }
 }
 
 /// Must be called BEFORE `close(fd)` so duplicated descriptors do not keep a
@@ -283,8 +279,8 @@ pub fn unregisterFd(self: *Epoll, fd: linux.fd_t) void {
             slot.generation = 1;
         }
     }
-    _ = slot.read_waiters.wakeAll();
-    _ = slot.write_waiters.wakeAll();
+    slot.read_waiters.wakeAll();
+    slot.write_waiters.wakeAll();
 }
 
 /// Polls `epoll_wait` once with `timeout_ms` (`-1` = infinite, `0` = immediate).
@@ -313,15 +309,15 @@ pub fn poll(self: *Epoll, timeout_ms: i32) usize {
 
         const flags = ev.events;
         if ((flags & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0) {
-            _ = slot.read_waiters.wakeAll();
-            _ = slot.write_waiters.wakeAll();
+            slot.read_waiters.wakeAll();
+            slot.write_waiters.wakeAll();
             continue;
         }
         if ((flags & (linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.PRI)) != 0) {
-            _ = slot.read_waiters.wakeOne();
+            slot.read_waiters.wakeOne();
         }
         if ((flags & linux.EPOLL.OUT) != 0) {
-            _ = slot.write_waiters.wakeOne();
+            slot.write_waiters.wakeOne();
         }
     }
     return n;

@@ -50,7 +50,6 @@ pub const JobState = enum(u8) {
     queued,
     running,
     canceled,
-    completed,
 };
 
 pub const Job = struct {
@@ -329,10 +328,6 @@ fn workerLoop(self: *BlockingPool) void {
 
         // Run blocking callable completely outside `self.mutex`.
         job.run_fn(job, &self.threaded);
-
-        self.mutex.lockUncancelable(kio);
-        job.state = .completed;
-        self.mutex.unlock(kio);
 
         // Deliver completion back to origin Shard's unbounded ResumeLane & Doorbell.
         const lane = job.resume_lane;

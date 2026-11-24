@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
+const Threaded = std.Io.Threaded;
 const Mailbox = @import("Mailbox.zig");
 const Doorbell = Mailbox.Doorbell;
 
@@ -136,6 +137,7 @@ pub fn init(max_fds: u32) InitError!Epoll {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
+        .INVAL => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     };
     errdefer _ = linux.close(ep_fd);
@@ -146,6 +148,7 @@ pub fn init(max_fds: u32) InitError!Epoll {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
+        .INVAL => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     };
     errdefer _ = linux.close(ev_fd);
@@ -157,6 +160,7 @@ pub fn init(max_fds: u32) InitError!Epoll {
     switch (linux.errno(linux.epoll_ctl(ep_fd, linux.EPOLL.CTL_ADD, ev_fd, &ev))) {
         .SUCCESS => {},
         .NOMEM, .NOSPC => return error.SystemResources,
+        .BADF, .FAULT, .INVAL, .LOOP => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 
@@ -184,7 +188,10 @@ pub fn notifyFromAnyThread(self: *Epoll) void {
         switch (linux.errno(rc)) {
             .SUCCESS, .AGAIN => return,
             .INTR => continue,
-            else => unreachable,
+            else => |err| {
+                Threaded.errnoBug(err) catch {};
+                return;
+            },
         }
     }
 }
@@ -213,7 +220,7 @@ pub fn waitIo(
     if (!slot.registered) {
         var ev: linux.epoll_event = .{
             .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.RDHUP | linux.EPOLL.ET,
-            .data = .{ .u64 = packData(fd, slot.generation) },
+            .data = .{ .u64 = packEventTag(fd, slot.generation) },
         };
         const ctl_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
         switch (linux.errno(ctl_rc)) {
@@ -223,11 +230,13 @@ pub fn waitIo(
                 switch (linux.errno(mod_rc)) {
                     .SUCCESS => {},
                     .NOMEM, .NOSPC => return error.SystemResources,
+                    .BADF, .FAULT, .INVAL, .LOOP => |err| return Threaded.errnoBug(err),
                     else => |err| return posix.unexpectedErrno(err),
                 }
             },
             .PERM => return error.PollUnsupported,
             .NOMEM, .NOSPC => return error.SystemResources,
+            .BADF, .FAULT, .INVAL, .LOOP => |err| return Threaded.errnoBug(err),
             else => |err| return posix.unexpectedErrno(err),
         }
         slot.registered = true;
@@ -290,7 +299,10 @@ pub fn poll(self: *Epoll, timeout_ms: i32) usize {
     const n: usize = switch (linux.errno(rc)) {
         .SUCCESS => rc,
         .INTR => return 0,
-        else => unreachable,
+        else => |err| {
+            Threaded.errnoBug(err) catch {};
+            return 0;
+        },
     };
 
     for (self.events_buf[0..n]) |ev| {
@@ -331,12 +343,15 @@ fn drainEventFd(self: *Epoll) void {
             .SUCCESS => continue,
             .AGAIN => return,
             .INTR => continue,
-            else => unreachable,
+            else => |err| {
+                Threaded.errnoBug(err) catch {};
+                return;
+            },
         }
     }
 }
 
-inline fn packData(fd: linux.fd_t, generation: u32) u64 {
+inline fn packEventTag(fd: linux.fd_t, generation: u32) u64 {
     const raw_fd: u32 = @bitCast(fd);
     return (@as(u64, generation) << 32) | @as(u64, raw_fd);
 }

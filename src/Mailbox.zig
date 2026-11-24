@@ -154,11 +154,11 @@ pub fn Mailbox(comptime T: type) type {
             return self.published_seq.load(.seq_cst) == 0;
         }
 
-        /// Splices all ready nodes in O(1) under the mutex, invokes `handler` on
+        /// Splices all ready nodes in O(1) under the mutex, invokes `consume_fn` on
         /// every payload outside the mutex, and returns the entire physical node
         /// chain to `free_head` in a single O(1) splice (`2 * capacity` nodes
         /// guarantee full concurrent admission capacity while draining).
-        pub fn drain(self: *Self, ctx: ?*anyopaque, handler: *const fn (?*anyopaque, T) void) usize {
+        pub fn drain(self: *Self, ctx: ?*anyopaque, consume_fn: *const fn (?*anyopaque, T) void) usize {
             const kio = kernelIo();
             var batch_head: u32 = no_node;
             var batch_tail: u32 = no_node;
@@ -186,7 +186,7 @@ pub fn Mailbox(comptime T: type) type {
             while (cur != no_node) {
                 const next = self.nodes[cur].next;
                 const value = self.nodes[cur].payload;
-                handler(ctx, value);
+                consume_fn(ctx, value);
                 cur = next;
             }
             return batch_len;
@@ -295,7 +295,7 @@ pub const ResumeLane = struct {
     }
 };
 
-test "Mailbox enforces capacity, returns rejected payload, and runs handlers unlocked" {
+test "Mailbox enforces capacity, returns rejected payload, and runs callbacks unlocked" {
     const gpa = std.testing.allocator;
     var mbox = try Mailbox(u32).init(gpa, 2);
     defer mbox.deinit(gpa, null);
@@ -314,7 +314,7 @@ test "Mailbox enforces capacity, returns rejected payload, and runs handlers unl
         fn onMsg(ctx: ?*anyopaque, val: u32) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.sum += val;
-            // Reentrant post inside handler proves `drain` runs outside `mutex`
+            // Reentrant post inside callback proves `drain` runs outside `mutex`
             // and `2 * capacity` nodes allow admission during active batch drain.
             if (val == 10) {
                 _ = self.mbox_ptr.tryPost(5);

@@ -94,6 +94,7 @@ blocking_pool: *BlockingPool,
 resume_lane: *ResumeLane,
 overflow_free: ?*OverflowOp = null,
 cached_overflow_count: usize = 0,
+pending_batch_count: usize = 0,
 
 /// Initializes `self` in-place (address-pinned).
 pub fn init(
@@ -121,6 +122,9 @@ pub fn init(
 }
 
 pub fn deinit(self: *LinuxIo, gpa: Allocator) void {
+    if (self.pending_batch_count != 0) {
+        @panic("islet.LinuxIo.deinit: Io.Batch pending operations were not awaited or canceled");
+    }
     var cur = self.overflow_free;
     self.overflow_free = null;
     self.cached_overflow_count = 0;
@@ -180,11 +184,12 @@ pub fn clockResolution(_: *LinuxIo, clock: Io.Clock) Io.Clock.ResolutionError!Io
     switch (linux.errno(rc)) {
         .SUCCESS => return .{ .nanoseconds = Threaded.nanosecondsFromPosix(&ts) },
         .INVAL => return error.ClockUnavailable,
+        .FAULT => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 }
 
-// ── Single-Wait `Epoll` Helper ──────────────────────────────────────────────
+// ── Single-Operation `Epoll` Wait ───────────────────────────────────────────
 
 fn waitFd(
     self: *LinuxIo,
@@ -295,14 +300,14 @@ fn waitFd(
 
 // ── File / Dir / Child Process Lifecycle ────────────────────────────────────
 
-pub fn fileClose(self: *LinuxIo, _: anytype, files: []const File) void {
+pub fn fileClose(self: *LinuxIo, files: []const File) void {
     for (files) |f| {
         self.poller.unregisterFd(f.handle);
         Threaded.closeFd(f.handle);
     }
 }
 
-pub fn dirClose(self: *LinuxIo, _: anytype, dirs: []const Dir) void {
+pub fn dirClose(self: *LinuxIo, dirs: []const Dir) void {
     for (dirs) |d| {
         self.poller.unregisterFd(d.handle);
         Threaded.closeFd(d.handle);
@@ -323,6 +328,7 @@ fn mapSendErrorToNetSend(err: linux.E) net.Socket.SendError {
         .PIPE, .NOTCONN => error.SocketUnconnected,
         .ACCES => error.AccessDenied,
         .TIMEDOUT => error.ConnectionTimedOut,
+        .BADF, .FAULT, .NOTSOCK => Threaded.errnoBug(err),
         else => posix.unexpectedErrno(err),
     };
 }
@@ -762,6 +768,7 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
                     .NETDOWN => return .{ .done = .{ .net_read = error.NetworkDown } },
                     .TIMEDOUT => return .{ .done = .{ .net_read = error.ConnectionTimedOut } },
                     .NOMEM, .NOBUFS => return .{ .done = .{ .net_read = error.SystemResources } },
+                    .BADF, .FAULT, .NOTSOCK => |err| return .{ .done = .{ .net_read = Threaded.errnoBug(err) } },
                     else => |err| return .{ .done = .{ .net_read = posix.unexpectedErrno(err) } },
                 }
             }
@@ -798,6 +805,7 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
                     .TIMEDOUT => return .{ .done = .{ .net_write = error.ConnectionTimedOut } },
                     .DESTADDRREQ => return .{ .done = .{ .net_write = error.SocketNotBound } },
                     .NOMEM, .NOBUFS => return .{ .done = .{ .net_write = error.SystemResources } },
+                    .BADF, .FAULT, .NOTSOCK => |err| return .{ .done = .{ .net_write = Threaded.errnoBug(err) } },
                     else => |err| return .{ .done = .{ .net_write = posix.unexpectedErrno(err) } },
                 }
             }
@@ -864,6 +872,7 @@ fn tryExecuteNonblocking(op: Io.Operation) TryPosixOp {
                             .NETDOWN => error.NetworkDown,
                             .CONNREFUSED => error.PortUnreachable,
                             .TIMEDOUT => error.ConnectionTimedOut,
+                            .BADF, .FAULT, .NOTSOCK => Threaded.errnoBug(err),
                             else => posix.unexpectedErrno(err),
                         };
                         return .{ .done = .{ .net_receive = .{ mapped, received_msgs } } };
@@ -1044,7 +1053,7 @@ fn batchAppendCompleted(batch: *Io.Batch, idx: u32, res: Io.Operation.Result) vo
     batch.completed.tail = oi;
 }
 
-fn batchAppendPending(batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag) *Io.Operation.Storage.Pending.Userdata {
+fn batchAppendPending(self: *LinuxIo, batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag) *Io.Operation.Storage.Pending.Userdata {
     const cur_oi = Io.Operation.OptionalIndex.fromIndex(idx);
     const prev_tail = batch.pending.tail;
     switch (prev_tail) {
@@ -1057,10 +1066,13 @@ fn batchAppendPending(batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag) *Io.Ope
         .userdata = @splat(0),
     } };
     batch.pending.tail = cur_oi;
+    self.pending_batch_count += 1;
     return &batch.storage[idx].pending.userdata;
 }
 
-fn batchRemovePending(batch: *Io.Batch, idx: u32) void {
+fn batchRemovePending(self: *LinuxIo, batch: *Io.Batch, idx: u32) void {
+    assert(self.pending_batch_count > 0);
+    self.pending_batch_count -= 1;
     const node = batch.storage[idx].pending.node;
     switch (node.prev) {
         .none => batch.pending.head = node.next,
@@ -1266,14 +1278,14 @@ fn onInlineBatchEpollReady(w: *Epoll.Waiter) void {
     switch (tryExecuteNonblocking(op)) {
         .done => |res| {
             self.cascadeAfterSuccess(op);
-            batchRemovePending(batch, idx);
+            self.batchRemovePending(batch, idx);
             batchAppendCompleted(batch, idx, res);
             self.wakeBatchAwaiter(batch);
         },
         .would_block => |wb| {
             // Spurious edge: re-arm inline waiter in place.
             self.poller.waitIo(self.gpa, wb.fd, wb.dir, &slot.waiter) catch {
-                batchRemovePending(batch, idx);
+                self.batchRemovePending(batch, idx);
                 batchReturnUnused(batch, idx);
                 self.wakeBatchAwaiter(batch);
             };
@@ -1289,7 +1301,7 @@ fn finishOverflowOp(bop: *OverflowOp) void {
     const maybe_res = bop.result;
     const was_canceled = bop.canceled;
 
-    batchRemovePending(batch, idx);
+    self.batchRemovePending(batch, idx);
     if (!was_canceled and maybe_res != null) {
         batchAppendCompleted(batch, idx, maybe_res.?);
     } else {
@@ -1354,7 +1366,7 @@ fn submitOverflowBlocking(self: *LinuxIo, bop: *OverflowOp) Io.ConcurrentError!v
     }
 }
 
-pub fn submitBatch(self: *LinuxIo, _: anytype, batch: *Io.Batch) Io.ConcurrentError!void {
+pub fn submitBatch(self: *LinuxIo, batch: *Io.Batch) Io.ConcurrentError!void {
     var cur_oi = batch.submitted.head;
     if (cur_oi == .none) return;
 
@@ -1383,17 +1395,17 @@ pub fn submitBatch(self: *LinuxIo, _: anytype, batch: *Io.Batch) Io.ConcurrentEr
             .would_block => |wb| {
                 // Zero-allocation fast path: store directly inside `batch.storage[idx].pending.userdata`!
                 if (tryPackInlineBatchOp(batch, op)) |packed_inline| {
-                    const ud = batchAppendPending(batch, idx, op);
+                    const ud = self.batchAppendPending(batch, idx, op);
                     const slot: *InlineBatchSlot = @ptrCast(@alignCast(ud));
                     slot.* = packed_inline;
                     self.poller.waitIo(self.gpa, wb.fd, wb.dir, &slot.waiter) catch |err| switch (err) {
                         error.PollUnsupported => {
-                            batchRemovePending(batch, idx);
+                            self.batchRemovePending(batch, idx);
                             batch.storage[idx] = .{ .submission = saved_sub };
                             try self.submitBatchPoolFallback(batch, idx, saved_sub);
                         },
                         else => {
-                            batchRemovePending(batch, idx);
+                            self.batchRemovePending(batch, idx);
                             batch.storage[idx] = .{ .submission = saved_sub };
                             return error.ConcurrencyUnavailable;
                         },
@@ -1415,19 +1427,19 @@ pub fn submitBatch(self: *LinuxIo, _: anytype, batch: *Io.Batch) Io.ConcurrentEr
                         .waiter = .{ .wake_fn = onOverflowEpollReady },
                     } },
                 };
-                const ud = batchAppendPending(batch, idx, op);
+                const ud = self.batchAppendPending(batch, idx, op);
                 ud[0] = @intFromPtr(bop);
                 self.poller.waitIo(self.gpa, wb.fd, wb.dir, &bop.backend.epoll.waiter) catch |err| switch (err) {
                     error.PollUnsupported => {
                         self.submitOverflowBlocking(bop) catch {
-                            batchRemovePending(batch, idx);
+                            self.batchRemovePending(batch, idx);
                             batch.storage[idx] = .{ .submission = saved_sub };
                             self.releaseOverflowOp(bop);
                             return error.ConcurrencyUnavailable;
                         };
                     },
                     else => {
-                        batchRemovePending(batch, idx);
+                        self.batchRemovePending(batch, idx);
                         batch.storage[idx] = .{ .submission = saved_sub };
                         self.releaseOverflowOp(bop);
                         return error.ConcurrencyUnavailable;
@@ -1457,10 +1469,10 @@ fn submitBatchPoolFallback(
         .slot_index = idx,
         .op = saved_sub.operation,
     };
-    const ud = batchAppendPending(batch, idx, saved_sub.operation);
+    const ud = self.batchAppendPending(batch, idx, saved_sub.operation);
     ud[0] = @intFromPtr(bop);
     self.submitOverflowBlocking(bop) catch {
-        batchRemovePending(batch, idx);
+        self.batchRemovePending(batch, idx);
         batch.storage[idx] = .{ .submission = saved_sub };
         self.releaseOverflowOp(bop);
         return error.ConcurrencyUnavailable;
@@ -1479,7 +1491,7 @@ pub fn cancelBatchPending(self: *LinuxIo, batch: *Io.Batch) void {
             const slot: *InlineBatchSlot = @ptrCast(@alignCast(&pending.userdata));
             const tag = pending.tag;
             self.poller.cancelWaiter(inlineFd(tag, slot), inlineDirection(tag), &slot.waiter);
-            batchRemovePending(batch, idx);
+            self.batchRemovePending(batch, idx);
             batchReturnUnused(batch, idx);
         } else {
             const bop: *OverflowOp = @ptrFromInt(pending.userdata[0]);
@@ -1508,6 +1520,7 @@ fn setSockOpt(fd: linux.fd_t, level: i32, optname: u32, val: []const u8) !void {
         .SUCCESS => {},
         .NOPROTOOPT, .INVAL => return error.OptionUnsupported,
         .NOMEM, .NOBUFS => return error.SystemResources,
+        .BADF, .FAULT, .NOTSOCK => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 }
@@ -1525,6 +1538,7 @@ fn mapConnectErr(err: linux.E) net.IpAddress.ConnectError {
         .ACCES, .PERM => error.AccessDenied,
         .NETDOWN => error.NetworkDown,
         .NOMEM, .NOBUFS => error.SystemResources,
+        .BADF, .FAULT, .NOTSOCK => Threaded.errnoBug(err),
         else => posix.unexpectedErrno(err),
     };
 }
@@ -1557,7 +1571,10 @@ fn openIpSocket(
     sock_protocol: ?net.Protocol,
 ) OpenIpSocketError!linux.fd_t {
     const family = Threaded.posixAddressFamily(address);
-    const mode, const protocol = try Threaded.posixSocketModeProtocol(family, sock_mode, sock_protocol);
+    const mode, const protocol = Threaded.posixSocketModeProtocol(family, sock_mode, sock_protocol) catch |err| switch (err) {
+        error.OptionUnsupported => return error.SocketModeUnsupported,
+        else => |e| return e,
+    };
     const sock_rc = linux.socket(family, mode | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, protocol);
     return switch (linux.errno(sock_rc)) {
         .SUCCESS => @intCast(sock_rc),
@@ -1591,6 +1608,7 @@ fn bindIpSocket(fd: linux.fd_t, address: *const net.IpAddress) BindIpError!void 
         .ACCES => return error.AccessDenied,
         .AFNOSUPPORT => return error.AddressFamilyUnsupported,
         .NOMEM, .NOBUFS => return error.SystemResources,
+        .BADF, .FAULT, .NOTSOCK => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 }
@@ -1603,6 +1621,7 @@ fn querySocketAddress(fd: linux.fd_t) posix.UnexpectedError!net.Socket {
             .handle = fd,
             .address = Threaded.addressFromPosix(&bound),
         },
+        .BADF, .FAULT, .NOTSOCK => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 }
@@ -1693,6 +1712,7 @@ pub fn netAccept(
                 return error.ProtocolFailure;
             },
             .NETDOWN => return error.NetworkDown,
+            .BADF, .FAULT, .NOTSOCK => |err| return Threaded.errnoBug(err),
             else => |err| return posix.unexpectedErrno(err),
         }
     }
@@ -1700,7 +1720,6 @@ pub fn netAccept(
 
 pub fn netBindIp(
     _: *LinuxIo,
-    _: anytype,
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
@@ -1767,7 +1786,6 @@ pub fn netConnectIp(
 
 pub fn netListenUnix(
     _: *LinuxIo,
-    _: anytype,
     ua: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
@@ -1972,6 +1990,7 @@ pub fn netShutdown(_: *LinuxIo, handle: net.Socket.Handle, how: net.ShutdownHow)
         .CONNRESET => return error.ConnectionResetByPeer,
         .CONNABORTED => return error.ConnectionAborted,
         .NOMEM, .NOBUFS => return error.SystemResources,
+        .BADF, .INVAL, .NOTSOCK => |err| return Threaded.errnoBug(err),
         else => |err| return posix.unexpectedErrno(err),
     }
 }

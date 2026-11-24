@@ -450,10 +450,6 @@ inline fn fromUserdata(userdata: ?*anyopaque) *Shard {
     return self;
 }
 
-inline fn fromUserdataAnyThread(userdata: ?*anyopaque) *Shard {
-    return @ptrCast(@alignCast(userdata.?));
-}
-
 // ── Cooperative Fiber Scheduler (Bounded LIFO Slot + FIFO ReadyQueue) ───────
 
 inline fn contextOfTask(self: *Shard, task: *Task) *fiber.ExecContext {
@@ -581,8 +577,9 @@ fn idleFiberEntry(arg: *anyopaque) void {
             continue;
         }
 
-        // Scavenge cold physical stack pages on newly cached idle Fibers before sleeping.
+        // Scavenge cold physical stack pages and excess idle timer slots before sleeping.
         self.stack_pool.scavengeIdle();
+        self.timers.scavengeIdle(self.gpa);
 
         // Arm coalesced doorbell BEFORE final `.seq_cst` emptiness check.
         self.driver.armDoorbell();
@@ -644,8 +641,7 @@ pub fn checkCancelPoint(self: *Shard) Io.Cancelable!void {
 }
 
 fn vtableCrashHandler(userdata: ?*anyopaque) void {
-    const self = fromUserdataAnyThread(userdata);
-    if (tls_current_shard != self) return;
+    const self = fromUserdata(userdata);
     const task = self.current_task;
     task.cancel_requested = true;
     task.cancel_protection = .{ .user = .blocked, .acknowledged = true };
@@ -686,7 +682,7 @@ fn spawnTaskFiber(
     const raw = self.stack_pool.acquire(self.gpa) catch return error.ConcurrencyUnavailable;
     errdefer self.stack_pool.release(self.gpa, raw);
 
-    const header_base = @intFromPtr(raw.headerBytes());
+    const header_base = @intFromPtr(&raw.header);
     const header_end = header_base + fiber.header_capacity;
 
     const task_addr = Alignment.of(Task).forward(header_base);
@@ -1097,7 +1093,7 @@ pub fn awakeNowNs(self: *Shard) i96 {
 }
 
 fn vtableNow(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
-    const self = fromUserdataAnyThread(userdata);
+    const self = fromUserdata(userdata);
     return self.driver.now(clock);
 }
 
@@ -1318,7 +1314,7 @@ fn vtableFutexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected:
 }
 
 fn vtableFutexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
-    const self = fromUserdataAnyThread(userdata);
+    const self: *Shard = @ptrCast(@alignCast(userdata.?));
     self.futex_table.wake(ptr, max_waiters);
 }
 
@@ -1441,7 +1437,7 @@ fn vtableBatchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
 
-    self.driver.submitBatch(self, batch) catch {};
+    self.driver.submitBatch(batch) catch {};
 
     // If any operation already completed or is concurrently in flight, return or await it
     // instead of synchronously blocking on remaining unsubmitted entries!
@@ -1488,7 +1484,7 @@ fn vtableBatchAwaitConcurrent(
 ) Io.Batch.AwaitConcurrentError!void {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    try self.driver.submitBatch(self, batch);
+    try self.driver.submitBatch(batch);
 
     if (batch.completed.head != .none or batch.pending.head == .none) return;
     return self.waitBatchCompletion(batch, timeout);
@@ -1568,7 +1564,6 @@ fn vtableBatchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
             self.suspendCurrent();
         }
     }
-    batch.userdata = null;
 }
 
 // ── VTable: Random & Stderr ─────────────────────────────────────────────────
@@ -1789,12 +1784,12 @@ fn forwardThreaded(comptime field: []const u8, comptime mode: ForwardMode) @Fiel
 
 fn vtableFileClose(userdata: ?*anyopaque, files: []const File) void {
     const self = fromUserdata(userdata);
-    self.driver.fileClose(self, files);
+    self.driver.fileClose(files);
 }
 
 fn vtableDirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
     const self = fromUserdata(userdata);
-    self.driver.dirClose(self, dirs);
+    self.driver.dirClose(dirs);
 }
 
 fn vtableFileWriteFileStreaming(
@@ -1872,7 +1867,7 @@ fn vtableNetBindIp(
 ) net.IpAddress.BindError!net.Socket {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    return self.driver.netBindIp(self, address, options);
+    return self.driver.netBindIp(address, options);
 }
 
 fn vtableNetConnectIp(
@@ -1897,7 +1892,7 @@ fn vtableNetListenUnix(
 ) net.UnixAddress.ListenError!net.Socket.Handle {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    return self.driver.netListenUnix(self, ua, options);
+    return self.driver.netListenUnix(ua, options);
 }
 
 fn vtableNetConnectUnix(

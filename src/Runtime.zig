@@ -10,19 +10,16 @@
 //! - Ordered teardown: `requestStop` -> Shard tasks finish -> `join` (panics on
 //!   self-join deadlock) -> `Acceptor` & `BlockingPool` & `ShardMesh` cleanup.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
 
 const Shard = @import("Shard.zig");
 const BlockingPool = @import("BlockingPool.zig");
 const FutexTable = @import("FutexTable.zig");
 const ShardMesh = @import("ShardMesh.zig");
 const SpscRingMod = @import("SpscRing.zig");
-const AcceptorMod = @import("Acceptor.zig");
-const Acceptor = AcceptorMod.Acceptor;
+const Acceptor = @import("Acceptor.zig").Acceptor;
 
 const Runtime = @This();
 
@@ -38,7 +35,7 @@ pub const InitOptions = struct {
     /// Maximum idle Fiber stacks retained per Shard before watermark eviction.
     max_cached_stacks: usize = 64,
     /// Maximum file descriptor table bound per Shard on Linux.
-    max_fds: u32 = if (builtin.os.tag == .linux) 65536 else 0,
+    max_fds: u32 = 65536,
     /// Worker thread stack size for each Shard's OS thread.
     thread_stack_size: usize = 1024 * 1024,
     /// Shared `BlockingPool` thread count (`null` defaults to `clamp((cpus+1)/2, 2, 8)`).
@@ -71,7 +68,6 @@ blocking_pool: BlockingPool = undefined,
 futex_table: FutexTable = .init,
 mesh: ShardMesh = undefined,
 acceptor: Acceptor = undefined,
-has_acceptor: bool = false,
 stderr_mutex: Io.Mutex = .init,
 
 state: State = .initialized,
@@ -92,10 +88,6 @@ pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void
         (if (n == 0) return error.InvalidCapacity else n)
     else
         @max(@as(usize, 1), std.Thread.getCpuCount() catch 1);
-
-    if (builtin.os.tag == .windows and resolved_count > 64) {
-        return error.InvalidCapacity;
-    }
 
     const shards = try gpa.alloc(Shard, resolved_count);
     errdefer gpa.free(shards);
@@ -120,11 +112,8 @@ pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void
     self.mesh = try ShardMesh.init(gpa, resolved_count, options.mesh_ring_capacity);
     errdefer self.mesh.deinit(gpa);
 
-    if (builtin.os.tag == .windows and resolved_count > 1) {
-        try self.acceptor.init(gpa, resolved_count, options.acceptor_inbox_capacity);
-        self.has_acceptor = true;
-    }
-    errdefer if (self.has_acceptor) self.acceptor.deinit(gpa);
+    try self.acceptor.init(gpa, resolved_count, options.acceptor_inbox_capacity);
+    errdefer self.acceptor.deinit(gpa);
 
     var initialized_shards: usize = 0;
     errdefer {
@@ -146,7 +135,7 @@ pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void
             .blocking_pool = &self.blocking_pool,
             .futex_table = &self.futex_table,
             .mesh = if (resolved_count > 1) &self.mesh else null,
-            .acceptor = if (self.has_acceptor) &self.acceptor else null,
+            .acceptor = self.acceptor.shardPtr(),
             .stderr_mutex = &self.stderr_mutex,
         });
         initialized_shards += 1;
@@ -161,7 +150,7 @@ pub fn deinit(self: *Runtime) void {
 
     const gpa = self.gpa;
     for (self.shards) |*s| s.deinitUnattached();
-    if (self.has_acceptor) self.acceptor.deinit(gpa);
+    self.acceptor.deinit(gpa);
     self.mesh.deinit(gpa);
     self.blocking_pool.deinit(gpa);
     gpa.free(self.threads);
@@ -180,7 +169,7 @@ pub fn isStopping(self: *const Runtime) bool {
 /// Thread-safe: initiates graceful stop across all Shards and Windows Acceptor.
 pub fn requestStop(self: *Runtime) void {
     self.stopping.store(true, .seq_cst);
-    if (self.has_acceptor) self.acceptor.requestStop();
+    self.acceptor.requestStop();
     for (self.shards) |*s| s.requestStop();
 }
 
@@ -382,8 +371,8 @@ pub fn join(self: *Runtime) void {
     self.joinThreadsOnly();
 }
 
-/// Convenience helper: runs `start(function, extra_args)`, joins all Shards,
-/// and propagates the first error if `function` returns `!void`.
+/// Starts all Shards with `function`, joins them on completion, and propagates
+/// the first returned error if `function` returns `!void`.
 pub fn run(
     self: *Runtime,
     comptime function: anytype,
@@ -421,7 +410,7 @@ fn assertNotSelfJoin(self: *const Runtime) void {
 fn joinThreadsOnly(self: *Runtime) void {
     for (self.threads[0..self.spawned_threads]) |t| t.join();
     self.spawned_threads = 0;
-    if (self.has_acceptor) self.acceptor.join();
+    self.acceptor.join();
     if (self.active_runner_ctx) |ctx| {
         self.cleanup_runner_fn.?(self.gpa, ctx);
         self.active_runner_ctx = null;

@@ -120,10 +120,6 @@ pub const RawFiber = struct {
         else => unreachable,
     };
 
-    pub fn headerBytes(self: *RawFiber) *[header_capacity]u8 {
-        return &self.header;
-    }
-
     pub fn arm(self: *RawFiber, entry_fn: EntryFn, entry_arg: *anyopaque) void {
         self.entry_fn = entry_fn;
         self.entry_arg = entry_arg;
@@ -279,26 +275,20 @@ fn linuxFiberEntry() callconv(.naked) void {
     }
 }
 
-fn linuxFiberLoop(raw: *RawFiber) callconv(.c) noreturn {
+inline fn runFiberLoop(raw: *RawFiber) noreturn {
     while (true) {
-        const func = raw.entry_fn;
-        const arg = raw.entry_arg;
-        func(arg);
-        const target = raw.exit_target.?;
-        switchContext(&raw.ctx, target);
+        raw.entry_fn(raw.entry_arg);
+        switchContext(&raw.ctx, raw.exit_target.?);
     }
+}
+
+fn linuxFiberLoop(raw: *RawFiber) callconv(.c) noreturn {
+    runFiberLoop(raw);
 }
 
 fn windowsFiberLoop(param: ?win32.LPVOID) callconv(.winapi) void {
     if (builtin.os.tag != .windows) unreachable;
-    const raw: *RawFiber = @ptrCast(@alignCast(param.?));
-    while (true) {
-        const func = raw.entry_fn;
-        const arg = raw.entry_arg;
-        func(arg);
-        const target = raw.exit_target.?;
-        switchContext(&raw.ctx, target);
-    }
+    runFiberLoop(@ptrCast(@alignCast(param.?)));
 }
 
 /// Shard-local lock-free (single-thread) LIFO Fiber stack cache with watermark
@@ -317,7 +307,13 @@ pub const StackPool = struct {
     }
 
     pub fn deinit(self: *StackPool, gpa: Allocator) void {
-        self.trimAll(gpa);
+        var cur = self.free_head;
+        while (cur) |raw| {
+            const next = raw.free_next;
+            raw.free_next = null;
+            raw.destroy(gpa);
+            cur = next;
+        }
         self.* = undefined;
     }
 
@@ -355,18 +351,6 @@ pub const StackPool = struct {
         while (cur) |raw| : (cur = raw.free_next) {
             if (raw.cold_scavenged) break;
             raw.scavengeColdPages();
-        }
-    }
-
-    pub fn trimAll(self: *StackPool, gpa: Allocator) void {
-        var cur = self.free_head;
-        self.free_head = null;
-        self.cached_count = 0;
-        while (cur) |raw| {
-            const next = raw.free_next;
-            raw.free_next = null;
-            raw.destroy(gpa);
-            cur = next;
         }
     }
 };

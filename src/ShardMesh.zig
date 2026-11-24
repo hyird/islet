@@ -6,8 +6,8 @@
 //! - Dedicated SPSC ring per ordered `(from, to)` Shard pair (`N * (N - 1)` rings).
 //! - Each target Shard owns a cache-line aligned `TargetInbox` with atomic `u64`
 //!   active-sender bitmap words:
-//!   - Producers only execute a modifying `.seq_cst` `fetchOr` when the sender bit
-//!     transitions `0 -> 1`, avoiding cache-line RMW ping-pong during bursts.
+//!   - Producers mark the sender bit via a modifying `.seq_cst` `fetchOr`,
+//!     pairing in modification order with the consumer's `.seq_cst` `swap(0)`.
 //!   - Consumers check `isEmptyForSeqCst` in O(1) (1 local word read for <= 64 Shards)
 //!     instead of scanning `N - 1` remote rings.
 //!   - Consumers drain active rings starting from `rr_cursor` with a bounded per-ring
@@ -125,19 +125,14 @@ inline fn targetWords(self: *const ShardMesh, to: usize) []AtomicWord {
 }
 
 /// Producer `from` thread only: pushes `msg` toward `to` without locking and marks
-/// `from` active in `to`'s bitmap if not already flagged.
+/// `from` active in `to`'s bitmap via a modifying `.seq_cst` RMW.
 pub fn trySend(self: *ShardMesh, from: usize, to: usize, msg: Message) Ring.PushResult {
     const res = self.rings[self.pairIndex(from, to)].tryPush(msg);
     if (res == .ok) {
         const words = self.targetWords(to);
         const word_idx = from >> 6;
         const mask = @as(u64, 1) << @intCast(from & 63);
-        // `tryPush` stored `tail` with `.seq_cst`. If a `.seq_cst` load already
-        // observes `mask` set, any future consumer `swap(0, .seq_cst)` is ordered
-        // after our `tail` store and is guaranteed to drain this item!
-        if ((words[word_idx].load(.seq_cst) & mask) == 0) {
-            _ = words[word_idx].fetchOr(mask, .seq_cst);
-        }
+        _ = words[word_idx].fetchOr(mask, .seq_cst);
     }
     return res;
 }
@@ -148,7 +143,7 @@ pub fn drainFor(
     self: *ShardMesh,
     to: usize,
     ctx: ?*anyopaque,
-    handler: *const fn (?*anyopaque, Message) void,
+    consume_fn: *const fn (?*anyopaque, Message) void,
 ) usize {
     if (self.shard_count <= 1) return 0;
 
@@ -183,7 +178,7 @@ pub fn drainFor(
                 const msg = ring.tryPop() orelse break;
                 ring_drained += 1;
                 total_drained += 1;
-                handler(ctx, msg);
+                consume_fn(ctx, msg);
             }
             if (ring_drained == drain_budget_per_ring and !ring.isEmptySeqCst()) {
                 rearm_mask |= @as(u64, 1) << bit_idx;

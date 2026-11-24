@@ -120,6 +120,7 @@ owner_ctx: *anyopaque,
 wake_task_fn: *const fn (owner_ctx: *anyopaque, task_ptr: *anyopaque) void,
 batch_op_free: ?*BatchOp = null,
 cached_batch_ops: usize = 0,
+pending_batch_count: usize = 0,
 shared_accepts: [64]SharedAcceptQueue = @splat(.{}),
 
 /// Initializes `self` in-place (address-pinned).
@@ -151,6 +152,9 @@ pub fn init(
 }
 
 pub fn deinit(self: *WindowsIo, gpa: Allocator) void {
+    if (self.pending_batch_count != 0) {
+        @panic("islet.WindowsIo.deinit: Io.Batch pending operations were not awaited or canceled");
+    }
     var cur = self.batch_op_free;
     self.batch_op_free = null;
     self.cached_batch_ops = 0;
@@ -259,23 +263,17 @@ pub fn clockResolution(self: *WindowsIo, clock: Io.Clock) Io.Clock.ResolutionErr
 
 // ── File / Dir / Child Process Lifecycle ────────────────────────────────────
 
-pub fn fileClose(self: *WindowsIo, shard: anytype, files: []const File) void {
-    for (files) |f| self.poller.unregisterHandle(f.handle);
-    shard.callBlocking(false, struct {
-        fn run(t: *Threaded, fs_slice: []const File) void {
-            const t_io = t.io();
-            t_io.vtable.fileClose(t_io.userdata, fs_slice);
-        }
-    }.run, .{files});
+pub fn fileClose(self: *WindowsIo, files: []const File) void {
+    for (files) |f| {
+        self.poller.unregisterHandle(f.handle);
+        windows.CloseHandle(f.handle);
+    }
 }
 
-pub fn dirClose(_: *WindowsIo, shard: anytype, dirs: []const Dir) void {
-    shard.callBlocking(false, struct {
-        fn run(t: *Threaded, ds: []const Dir) void {
-            const t_io = t.io();
-            t_io.vtable.dirClose(t_io.userdata, ds);
-        }
-    }.run, .{dirs});
+pub fn dirClose(_: *WindowsIo, dirs: []const Dir) void {
+    for (dirs) |d| {
+        windows.CloseHandle(d.handle);
+    }
 }
 
 pub fn fileWriteFileStreaming(
@@ -362,7 +360,7 @@ pub fn childKill(_: *WindowsIo, shard: anytype, child: *std.process.Child) void 
     }.run, .{child});
 }
 
-// ── IOCP Single-Wait Helper (`OVERLAPPED` Iron Law) ─────────────────────────
+// ── IOCP Single-Operation Wait (`OVERLAPPED` Iron Law) ──────────────────────
 
 const IocpWaitResult = struct {
     bytes: u32,
@@ -852,7 +850,7 @@ fn batchAppendCompleted(batch: *Io.Batch, idx: u32, res: Io.Operation.Result) vo
     batch.completed.tail = oi;
 }
 
-fn batchAppendPending(batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag, bop: *BatchOp) void {
+fn batchAppendPending(self: *WindowsIo, batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag, bop: *BatchOp) void {
     const cur_oi = Io.Operation.OptionalIndex.fromIndex(idx);
     const prev_tail = batch.pending.tail;
     switch (prev_tail) {
@@ -865,9 +863,12 @@ fn batchAppendPending(batch: *Io.Batch, idx: u32, tag: Io.Operation.Tag, bop: *B
         .userdata = .{ @intFromPtr(bop), 0, 0, 0, 0, 0, 0 },
     } };
     batch.pending.tail = cur_oi;
+    self.pending_batch_count += 1;
 }
 
-fn batchRemovePending(batch: *Io.Batch, idx: u32) void {
+fn batchRemovePending(self: *WindowsIo, batch: *Io.Batch, idx: u32) void {
+    assert(self.pending_batch_count > 0);
+    self.pending_batch_count -= 1;
     const node = batch.storage[idx].pending.node;
     switch (node.prev) {
         .none => batch.pending.head = node.next,
@@ -903,7 +904,7 @@ fn finishBatchOp(bop: *BatchOp) void {
     const maybe_res = bop.result;
     const was_canceled = bop.canceled;
 
-    batchRemovePending(batch, idx);
+    self.batchRemovePending(batch, idx);
     if (!was_canceled and maybe_res != null) {
         batchAppendCompleted(batch, idx, maybe_res.?);
     } else {
@@ -1189,7 +1190,7 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
     }
 }
 
-pub fn submitBatch(self: *WindowsIo, _: anytype, batch: *Io.Batch) Io.ConcurrentError!void {
+pub fn submitBatch(self: *WindowsIo, batch: *Io.Batch) Io.ConcurrentError!void {
     var cur_oi = batch.submitted.head;
     if (cur_oi == .none) return;
     errdefer {
@@ -1210,10 +1211,10 @@ pub fn submitBatch(self: *WindowsIo, _: anytype, batch: *Io.Batch) Io.Concurrent
             .slot_index = idx,
             .op = op,
         };
-        batchAppendPending(batch, idx, op, bop);
+        self.batchAppendPending(batch, idx, op, bop);
 
         self.submitSingleBatchOp(bop) catch {
-            batchRemovePending(batch, idx);
+            self.batchRemovePending(batch, idx);
             batch.storage[idx] = .{ .submission = saved_sub };
             self.releaseBatchOp(bop);
             return error.ConcurrencyUnavailable;
@@ -1458,7 +1459,6 @@ fn acceptFromAcceptor(self: *WindowsIo, shard: anytype, acc: *Acceptor, listener
 
 pub fn netBindIp(
     self: *WindowsIo,
-    _: anytype,
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
@@ -1566,7 +1566,6 @@ fn fillUnixSockaddr(ua: *const net.UnixAddress, sun: *posix.sockaddr.un) posix.s
 
 pub fn netListenUnix(
     self: *WindowsIo,
-    _: anytype,
     ua: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {

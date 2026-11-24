@@ -30,8 +30,11 @@ pub const AcceptedSocket = if (builtin.os.tag == .windows) struct {
 } else void;
 
 const NoopAcceptor = struct {
-    pub fn init(_: *NoopAcceptor, _: Allocator, _: usize, _: u32) Allocator.Error!void {}
+    pub fn init(_: *NoopAcceptor, _: Allocator, _: usize, _: u32) error{InvalidCapacity}!void {}
     pub fn deinit(_: *NoopAcceptor, _: Allocator) void {}
+    pub fn shardPtr(_: *NoopAcceptor) ?*NoopAcceptor {
+        return null;
+    }
     pub fn bindShard(_: *NoopAcceptor, _: usize, _: ?*anyopaque, _: *const fn (?*anyopaque) void) void {}
     pub fn requestStop(_: *NoopAcceptor) void {}
     pub fn join(_: *NoopAcceptor) void {}
@@ -93,6 +96,7 @@ const WindowsAcceptor = struct {
         slots: [accepts_per_listener]AcceptSlot = undefined,
     };
 
+    enabled: bool = false,
     gpa: Allocator,
     shard_count: usize,
     inbox_capacity: u32,
@@ -115,7 +119,20 @@ const WindowsAcceptor = struct {
         shard_count: usize,
         inbox_capacity: u32,
     ) (Allocator.Error || Iocp.InitError || error{InvalidCapacity})!void {
-        assert(shard_count > 0 and shard_count <= 64);
+        if (shard_count == 0 or shard_count > 64) return error.InvalidCapacity;
+        if (shard_count == 1) {
+            self.* = .{
+                .enabled = false,
+                .gpa = gpa,
+                .shard_count = 1,
+                .inbox_capacity = 0,
+                .shards = &.{},
+                .tokens = &.{},
+                .listeners = &.{},
+                .iocp = undefined,
+            };
+            return;
+        }
         const cap = @max(@as(u32, 16), inbox_capacity);
 
         const shards = try gpa.alloc(ShardTarget, shard_count);
@@ -143,6 +160,7 @@ const WindowsAcceptor = struct {
         errdefer iocp.deinit(gpa);
 
         self.* = .{
+            .enabled = true,
             .gpa = gpa,
             .shard_count = shard_count,
             .inbox_capacity = cap,
@@ -154,6 +172,10 @@ const WindowsAcceptor = struct {
     }
 
     pub fn deinit(self: *WindowsAcceptor, gpa: Allocator) void {
+        if (!self.enabled) {
+            self.* = undefined;
+            return;
+        }
         self.join();
         for (self.shards) |*s| {
             s.inbox.deinit(gpa, closeAcceptedSocket);
@@ -163,6 +185,10 @@ const WindowsAcceptor = struct {
         gpa.free(self.tokens);
         gpa.free(self.shards);
         self.* = undefined;
+    }
+
+    pub fn shardPtr(self: *WindowsAcceptor) ?*WindowsAcceptor {
+        return if (self.enabled) self else null;
     }
 
     pub fn bindShard(
@@ -359,9 +385,9 @@ const WindowsAcceptor = struct {
         self: *WindowsAcceptor,
         shard_id: usize,
         ctx: ?*anyopaque,
-        handler: *const fn (?*anyopaque, AcceptedSocket) void,
+        consume_fn: *const fn (?*anyopaque, AcceptedSocket) void,
     ) usize {
-        return self.shards[shard_id].inbox.drain(ctx, handler);
+        return self.shards[shard_id].inbox.drain(ctx, consume_fn);
     }
 
     pub fn isShardInboxEmptySeqCst(self: *const WindowsAcceptor, shard_id: usize) bool {
@@ -377,6 +403,7 @@ const WindowsAcceptor = struct {
     }
 
     pub fn requestStop(self: *WindowsAcceptor) void {
+        if (!self.enabled) return;
         if (self.stopping.swap(true, .seq_cst)) return;
         const kio = kernelIo();
         self.mutex.lockUncancelable(kio);
@@ -399,6 +426,7 @@ const WindowsAcceptor = struct {
     }
 
     pub fn join(self: *WindowsAcceptor) void {
+        if (!self.enabled) return;
         self.requestStop();
         const kio = kernelIo();
         self.mutex.lockUncancelable(kio);

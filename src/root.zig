@@ -1178,3 +1178,47 @@ test "Round 3 E2E: Batch.awaitAsync partial OOM progress, Group multi-round reus
         try std.testing.expectEqual(@as(usize, 5), rst.r2_bytes);
     }
 }
+
+test "AGENTS.md regressions: Runtime InvalidCapacity, post-burst Shard timer watermark scavenging, and cross-thread futexWake" {
+    const gpa = std.testing.allocator;
+
+    var bad_rt: Runtime = undefined;
+    try std.testing.expectError(error.InvalidCapacity, bad_rt.init(gpa, .{ .shard_count = 0 }));
+
+    var shard: Shard = undefined;
+    try shard.init(gpa, .{});
+    defer shard.deinit();
+    const io = shard.io();
+
+    // Verify `vtable.now` works on owning Shard thread and a timer burst > 256 scavenges cleanly on idle sleep.
+    const t0 = Io.Clock.awake.now(io);
+    var grp: Io.Group = .init;
+    defer grp.cancel(io);
+    for (0..300) |_| {
+        try grp.concurrent(io, struct {
+            fn nap(task_io: Io) Io.Cancelable!void {
+                try task_io.sleep(.fromNanoseconds(10_000), .awake);
+            }
+        }.nap, .{io});
+    }
+    try grp.await(io);
+
+    // Trigger idle sleep pass so `timers.scavengeIdle` and `stack_pool.scavengeIdle` reclaim burst memory.
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(Io.Clock.awake.now(io).nanoseconds >= t0.nanoseconds);
+
+    // Verify cross-thread `futexWake` wakes parked Shard fiber while off-Shard thread never touches other VTable entries.
+    var gate: std.atomic.Value(u32) = .init(0);
+    const Waker = struct {
+        fn run(cross_io: Io, g: *std.atomic.Value(u32)) void {
+            g.store(1, .release);
+            cross_io.vtable.futexWake(cross_io.userdata, &g.raw, 1);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waker.run, .{ io, &gate });
+    defer t.join();
+    while (gate.load(.acquire) == 0) {
+        try io.vtable.futexWait(io.userdata, &gate.raw, 0, .none);
+    }
+    try std.testing.expectEqual(@as(u32, 1), gate.load(.acquire));
+}

@@ -54,6 +54,8 @@ pub fn resolveAwakeDeadlineNs(
 }
 
 const heap_arity = 4;
+const max_timers: u32 = 1 << 24;
+pub const max_cached_capacity: usize = 256;
 
 pub const Outcome = enum {
     expired,
@@ -99,6 +101,7 @@ slots: std.ArrayListUnmanaged(Slot) = .empty,
 heap: std.ArrayListUnmanaged(Entry) = .empty,
 free_head: u32 = no_slot,
 active_count: usize = 0,
+min_generation: u64 = 1,
 next_sequence: u64 = 1,
 dispatching: bool = false,
 dispatch_round_ns: i96 = std.math.minInt(i96),
@@ -117,6 +120,26 @@ pub inline fn hasActive(self: *const TimerHeap) bool {
     return self.heap.items.len != 0;
 }
 
+/// Reclaims excess backing storage back to `gpa` when idle (`active_count == 0`)
+/// and capacity exceeds `max_cached_capacity`, advancing `min_generation` past
+/// all previously issued slot generations so stale tokens remain ABA-safe.
+pub fn scavengeIdle(self: *TimerHeap, gpa: Allocator) void {
+    if (self.active_count != 0) return;
+    assert(self.heap.items.len == 0);
+    if (self.heap.capacity > max_cached_capacity) {
+        self.heap.clearAndFree(gpa);
+    }
+    if (self.slots.capacity > max_cached_capacity) {
+        var max_gen = self.min_generation;
+        for (self.slots.items) |s| {
+            if (s.generation > max_gen) max_gen = s.generation;
+        }
+        self.min_generation = if (max_gen == std.math.maxInt(u64)) 1 else max_gen + 1;
+        self.slots.clearAndFree(gpa);
+        self.free_head = no_slot;
+    }
+}
+
 /// Schedules a callback at `deadline_ns` (monotonic `.awake` nanoseconds).
 /// Must be called on the owning Shard thread.
 pub fn schedule(
@@ -133,15 +156,16 @@ pub fn schedule(
         self.free_head = self.slots.items[idx].next_free;
         break :blk idx;
     } else blk: {
+        if (self.slots.items.len >= max_timers) return error.OutOfMemory;
         const idx: u32 = @intCast(self.slots.items.len);
-        try self.slots.append(gpa, .{});
+        try self.slots.append(gpa, .{ .generation = self.min_generation - 1 });
         break :blk idx;
     };
 
     const heap_idx = self.heap.items.len;
     const slot = &self.slots.items[slot_index];
     slot.generation +%= 1;
-    if (slot.generation == 0) slot.generation = 1;
+    if (slot.generation < self.min_generation) slot.generation = self.min_generation;
     slot.next_free = no_slot;
     slot.heap_index = @intCast(heap_idx);
     slot.occupied = true;
@@ -400,4 +424,35 @@ test "ceilWaitMs never truncates positive sub-millisecond durations to zero" {
     try std.testing.expectEqual(@as(u31, 1), ceilWaitMs(std.time.ns_per_ms));
     try std.testing.expectEqual(@as(u31, 2), ceilWaitMs(std.time.ns_per_ms + 1));
     try std.testing.expectEqual(max_wait_ms, ceilWaitMs(std.math.maxInt(i96)));
+}
+
+test "TimerHeap scavengeIdle reclaims post-burst capacity and preserves ABA immunity" {
+    const gpa = std.testing.allocator;
+    var heap: TimerHeap = .init;
+    defer heap.deinit(gpa);
+
+    const noop = struct {
+        fn cb(_: ?*anyopaque, _: Outcome) void {}
+    }.cb;
+
+    const burst = max_cached_capacity + 64;
+    var stale_tok0: Token = .inactive;
+    for (0..burst) |i| {
+        const tok = try heap.schedule(gpa, @intCast(i + 1), null, noop);
+        if (i == 0) stale_tok0 = tok;
+    }
+    try std.testing.expect(heap.slots.capacity > max_cached_capacity);
+    try std.testing.expectEqual(@as(usize, burst), heap.fireExpired(10_000));
+    try std.testing.expect(!heap.hasActive());
+
+    heap.scavengeIdle(gpa);
+    try std.testing.expect(heap.heap.capacity <= max_cached_capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.slots.capacity);
+
+    // Reallocate slot 0 after shrink: stale token from before `scavengeIdle` MUST NOT cancel it!
+    const fresh_tok0 = try heap.schedule(gpa, 50_000, null, noop);
+    try std.testing.expectEqual(@as(u32, 0), fresh_tok0.slot);
+    try std.testing.expect(fresh_tok0.generation > stale_tok0.generation);
+    try std.testing.expect(!heap.cancel(stale_tok0));
+    try std.testing.expect(heap.cancel(fresh_tok0));
 }

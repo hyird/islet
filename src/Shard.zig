@@ -835,6 +835,16 @@ fn vtableAsync(
         context_alignment,
         start,
     ) catch {
+        const self = fromUserdata(userdata);
+        const cur = self.current_task;
+        const saved_req = cur.cancel_requested;
+        const saved_prot = cur.cancel_protection;
+        cur.cancel_requested = false;
+        cur.cancel_protection = .{};
+        defer {
+            cur.cancel_requested = saved_req;
+            cur.cancel_protection = saved_prot;
+        }
         start(context.ptr, result.ptr);
         return null;
     };
@@ -1007,6 +1017,16 @@ fn vtableGroupAsync(
     start: *const fn (context: *const anyopaque) void,
 ) void {
     vtableGroupConcurrent(userdata, group, context, context_alignment, start) catch {
+        const self = fromUserdata(userdata);
+        const cur = self.current_task;
+        const saved_req = cur.cancel_requested;
+        const saved_prot = cur.cancel_protection;
+        cur.cancel_requested = (group.state & group_cancel_bit) != 0;
+        cur.cancel_protection = .{};
+        defer {
+            cur.cancel_requested = saved_req;
+            cur.cancel_protection = saved_prot;
+        }
         start(context.ptr);
     };
 }
@@ -1058,6 +1078,7 @@ fn vtableGroupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) 
     while (group.token.load(.acquire) != null) {
         self.suspendCurrent();
     }
+    group.state = 0;
 
     if (wait_st.canceled) {
         if (cur.shouldCancelNow()) cur.acknowledgeCancel();
@@ -1068,10 +1089,16 @@ fn vtableGroupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) 
 fn vtableGroupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
     _ = token;
     const self = fromUserdata(userdata);
-    if (group.token.load(.acquire) == null) return;
+    if (group.token.load(.acquire) == null) {
+        group.state = 0;
+        return;
+    }
 
     self.cancelGroupMembers(group);
-    if (group.token.load(.acquire) == null) return;
+    if (group.token.load(.acquire) == null) {
+        group.state = 0;
+        return;
+    }
 
     const cur = self.current_task;
     assert((group.state & group_ptr_mask) == 0);
@@ -1079,6 +1106,7 @@ fn vtableGroupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque)
     while (group.token.load(.acquire) != null) {
         self.suspendCurrent();
     }
+    group.state = 0;
 }
 
 // ── VTable: Clock & `sleep` ─────────────────────────────────────────────────
@@ -1428,30 +1456,44 @@ fn vtableBatchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
 
-    self.driver.submitBatch(self, batch) catch {
-        if (batch.submitted.head != .none) {
-            const idx = batch.submitted.head.toIndex();
-            const op = batch.storage[idx].submission.operation;
-            const next_oi = batch.storage[idx].submission.node.next;
-            batch.submitted.head = next_oi;
-            if (next_oi == .none) batch.submitted.tail = .none;
-            const res = try self.driver.operate(self, op);
-            const oi = Io.Operation.OptionalIndex.fromIndex(idx);
-            switch (batch.completed.tail) {
-                .none => batch.completed.head = oi,
-                else => |tail_oi| batch.storage[tail_oi.toIndex()].completion.node.next = oi,
-            }
-            batch.storage[idx] = .{ .completion = .{ .node = .{ .next = .none }, .result = res } };
-            batch.completed.tail = oi;
-            return;
-        }
-    };
+    self.driver.submitBatch(self, batch) catch {};
 
-    if (batch.completed.head != .none or batch.pending.head == .none) return;
-    return self.waitBatchCompletion(batch, .none) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        error.Timeout => unreachable,
-    };
+    // If any operation already completed or is concurrently in flight, return or await it
+    // instead of synchronously blocking on remaining unsubmitted entries!
+    if (batch.completed.head != .none) return;
+    if (batch.pending.head != .none) {
+        return self.waitBatchCompletion(batch, .none) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Timeout => unreachable,
+        };
+    }
+
+    if (batch.submitted.head != .none) {
+        const idx = batch.submitted.head.toIndex();
+        const op = batch.storage[idx].submission.operation;
+        const next_oi = batch.storage[idx].submission.node.next;
+        batch.submitted.head = next_oi;
+        if (next_oi == .none) batch.submitted.tail = .none;
+
+        const oi = Io.Operation.OptionalIndex.fromIndex(idx);
+        errdefer {
+            const tail = batch.unused.tail;
+            switch (tail) {
+                .none => batch.unused.head = oi,
+                else => |tail_oi| batch.storage[tail_oi.toIndex()].unused.next = oi,
+            }
+            batch.storage[idx] = .{ .unused = .{ .prev = tail, .next = .none } };
+            batch.unused.tail = oi;
+        }
+
+        const res = try self.driver.operate(self, op);
+        switch (batch.completed.tail) {
+            .none => batch.completed.head = oi,
+            else => |tail_oi| batch.storage[tail_oi.toIndex()].completion.node.next = oi,
+        }
+        batch.storage[idx] = .{ .completion = .{ .node = .{ .next = .none }, .result = res } };
+        batch.completed.tail = oi;
+    }
 }
 
 fn vtableBatchAwaitConcurrent(
@@ -1748,6 +1790,49 @@ fn forwardThreaded(comptime field: []const u8, comptime cancelable: bool) @Field
                 }
             }.call,
             else => @compileError("unexpected VTable arity"),
+        };
+    }.impl;
+}
+
+/// Inline zero-hop forwarder for pure in-RAM kernel descriptor, handle-flag, or PEB
+/// operations (`lseek`, `flock(LOCK_NB/LOCK_UN)`, `getcwd`, `FD_CLOEXEC`) that never
+/// block on disk or network I/O.
+fn forwardThreadedInline(comptime field: []const u8, comptime cancelable: bool) @FieldType(Io.VTable, field) {
+    const FnType = @typeInfo(@FieldType(Io.VTable, field)).pointer.child;
+    const fn_info = @typeInfo(FnType).@"fn";
+    const Ret = fn_info.return_type.?;
+    const can_cancel = comptime cancelable and switch (@typeInfo(Ret)) {
+        .error_union => |eu| (eu.error_set || error{Canceled}) == eu.error_set,
+        else => false,
+    };
+
+    return &struct {
+        const impl = switch (fn_info.param_types.len) {
+            1 => struct {
+                fn call(p0: fn_info.param_types[0].?) Ret {
+                    const self = fromUserdata(p0);
+                    if (can_cancel) try self.checkCancelPoint();
+                    const t_io = self.blocking_pool.threaded.io();
+                    return @field(t_io.vtable, field)(t_io.userdata);
+                }
+            }.call,
+            2 => struct {
+                fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?) Ret {
+                    const self = fromUserdata(p0);
+                    if (can_cancel) try self.checkCancelPoint();
+                    const t_io = self.blocking_pool.threaded.io();
+                    return @field(t_io.vtable, field)(t_io.userdata, p1);
+                }
+            }.call,
+            3 => struct {
+                fn call(p0: fn_info.param_types[0].?, p1: fn_info.param_types[1].?, p2: fn_info.param_types[2].?) Ret {
+                    const self = fromUserdata(p0);
+                    if (can_cancel) try self.checkCancelPoint();
+                    const t_io = self.blocking_pool.threaded.io();
+                    return @field(t_io.vtable, field)(t_io.userdata, p1, p2);
+                }
+            }.call,
+            else => @compileError("unexpected inline VTable arity"),
         };
     }.impl;
 }
@@ -2104,8 +2189,8 @@ const vtable: Io.VTable = .{
     .fileWriteFileStreaming = vtableFileWriteFileStreaming,
     .fileWriteFilePositional = vtableFileWriteFilePositional,
     .fileReadPositional = forwardThreaded("fileReadPositional", true),
-    .fileSeekBy = forwardThreaded("fileSeekBy", true),
-    .fileSeekTo = forwardThreaded("fileSeekTo", true),
+    .fileSeekBy = forwardThreadedInline("fileSeekBy", true),
+    .fileSeekTo = forwardThreadedInline("fileSeekTo", true),
     .fileSync = forwardThreaded("fileSync", true),
     .fileIsTty = forwardThreaded("fileIsTty", true),
     .fileEnableAnsiEscapeCodes = forwardThreaded("fileEnableAnsiEscapeCodes", true),
@@ -2115,8 +2200,8 @@ const vtable: Io.VTable = .{
     .fileSetPermissions = forwardThreaded("fileSetPermissions", true),
     .fileSetTimestamps = forwardThreaded("fileSetTimestamps", true),
     .fileLock = forwardThreaded("fileLock", true),
-    .fileTryLock = forwardThreaded("fileTryLock", true),
-    .fileUnlock = forwardThreaded("fileUnlock", false),
+    .fileTryLock = forwardThreadedInline("fileTryLock", true),
+    .fileUnlock = forwardThreadedInline("fileUnlock", false),
     .fileDowngradeLock = forwardThreaded("fileDowngradeLock", true),
     .fileRealPath = forwardThreaded("fileRealPath", true),
     .fileHardLink = forwardThreaded("fileHardLink", true),
@@ -2132,7 +2217,7 @@ const vtable: Io.VTable = .{
     .lockStderr = vtableLockStderr,
     .tryLockStderr = vtableTryLockStderr,
     .unlockStderr = vtableUnlockStderr,
-    .processCurrentPath = forwardThreaded("processCurrentPath", true),
+    .processCurrentPath = forwardThreadedInline("processCurrentPath", true),
     .processSetCurrentDir = forwardThreaded("processSetCurrentDir", true),
     .processSetCurrentPath = forwardThreaded("processSetCurrentPath", true),
     .processReplace = forwardThreaded("processReplace", true),
@@ -2140,9 +2225,9 @@ const vtable: Io.VTable = .{
     .childWait = vtableChildWait,
     .childKill = vtableChildKill,
 
-    .progressParentFile = forwardThreaded("progressParentFile", true),
-    .inheritParentDir = forwardThreaded("inheritParentDir", true),
-    .inheritParentFile = forwardThreaded("inheritParentFile", true),
+    .progressParentFile = forwardThreadedInline("progressParentFile", true),
+    .inheritParentDir = forwardThreadedInline("inheritParentDir", true),
+    .inheritParentFile = forwardThreadedInline("inheritParentFile", true),
 
     .now = vtableNow,
     .clockResolution = vtableClockResolution,

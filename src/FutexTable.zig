@@ -2,13 +2,24 @@
 //! (`Io.Mutex`, `Io.Condition`, `Io.Event`, `Io.RwLock`, `Io.Semaphore`, `Io.Queue`,
 //! `Io.Select`) across Fibers within a Shard and across Shards/threads.
 //!
-//! Design invariants (AGENTS.md §3, §4):
-//! - Fibonacci-hashed address striping (adapted from `std.Io.Dispatch`).
-//! - Wait-free fast path on uncontended `wake` (`num_waiters` `.release` RMW == 0).
+//! Design invariants & weak-memory (`aarch64` / `x86_64`) modification-order proof:
+//! - Fibonacci-hashed address striping (256 cache-line isolated stripes).
+//! - Single-word packed `state: std.atomic.Value(u64)` (`(wake_epoch << 32) | waiters`):
+//!   - `tryPark` executes `state.fetchAdd(1, .seq_cst)` BEFORE locking `stripe.mutex`
+//!     and checking `@atomicLoad(u32, waiter.ptr, .seq_cst)`.
+//!   - `wake` (after caller's `.release` or `.seq_cst` store to `*ptr`) executes a
+//!     real modifying RMW `const prev = state.fetchAdd(1 << 32, .seq_cst)` on the
+//!     **exact same** `state` word and returns in O(1) if `@truncate(u32, prev) == 0`.
+//!   - Because both `tryPark` and `wake` perform `.acq_rel`/`.seq_cst` RMWs in the
+//!     single modification order of `stripe.state`:
+//!     1. If `wake`'s RMW precedes `tryPark`'s RMW, `wake`'s release synchronizes-with
+//!        `tryPark`'s acquire via `stripe.state`'s release sequence, so the caller's
+//!        prior `.release` store to `*ptr` strictly happens-before `tryPark`'s load of
+//!        `*ptr` even on weak-memory ARMv8 (`aarch64`).
+//!     2. If `tryPark`'s RMW precedes `wake`'s RMW, `wake` observes `waiters >= 1`
+//!        in `prev` and enters `stripe.mutex`.
 //! - Stripe mutex ONLY links/unlinks intrusive stack-resident `Waiter` nodes;
 //!   all Shard wakeup callbacks and doorbell syscalls run strictly outside the mutex.
-//! - `unpark` returns `false` if `wake` already claimed the node so the caller
-//!   waits uncancelably for the in-flight wakeup before unwinding its stack frame.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,6 +29,7 @@ const FutexTable = @This();
 
 const stripe_bits = 8;
 const stripe_count = 1 << stripe_bits;
+const wake_epoch_inc: u64 = @as(u64, 1) << 32;
 const fibonacci_multiplier: usize = if (@bitSizeOf(usize) == 64)
     0x9E3779B97F4A7C15
 else
@@ -34,8 +46,8 @@ pub const Waiter = struct {
 };
 
 const Stripe = struct {
-    num_waiters: std.atomic.Value(usize) align(cache_line) = .init(0),
-    wake_seq: std.atomic.Value(usize) = .init(0),
+    /// Low 32 bits: parked waiter count; high 32 bits: monotonic `wake` RMW epoch.
+    state: std.atomic.Value(u64) align(cache_line) = .init(0),
     mutex: std.Io.Mutex = .init,
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
@@ -63,13 +75,12 @@ pub fn tryPark(self: *FutexTable, waiter: *Waiter) bool {
     const stripe = self.stripeFor(waiter.ptr);
     const kio = kernelIo();
 
-    // Increment `num_waiters` with `.seq_cst` BEFORE checking `*ptr` to form a
-    // Store-Buffering Dekker pair with `wake`'s `.seq_cst` `wake_seq` RMW + load.
-    _ = stripe.num_waiters.fetchAdd(1, .seq_cst);
+    const prev = stripe.state.fetchAdd(1, .seq_cst);
+    assert(@as(u32, @truncate(prev)) < std.math.maxInt(u32));
 
     stripe.mutex.lockUncancelable(kio);
     if (@atomicLoad(u32, waiter.ptr, .seq_cst) != waiter.expected) {
-        _ = stripe.num_waiters.fetchSub(1, .seq_cst);
+        _ = stripe.state.fetchSub(1, .seq_cst);
         stripe.mutex.unlock(kio);
         return false;
     }
@@ -114,7 +125,7 @@ pub fn unpark(self: *FutexTable, waiter: *Waiter) bool {
     waiter.prev = null;
     waiter.next = null;
     waiter.linked = false;
-    _ = stripe.num_waiters.fetchSub(1, .monotonic);
+    _ = stripe.state.fetchSub(1, .monotonic);
     stripe.mutex.unlock(kio);
     return true;
 }
@@ -125,15 +136,17 @@ pub fn wake(self: *FutexTable, ptr: *const u32, max_waiters: u32) void {
     if (max_waiters == 0) return;
     const stripe = self.stripeFor(ptr);
 
-    // Uncontended fast path: real modifying `.seq_cst` RMW (`wake_seq.fetchAdd(1)`)
-    // emits a full hardware barrier (cannot be folded away like `fetchAdd(0)`),
-    // ordering any prior `.release` store to `*ptr` before reading `num_waiters`.
-    _ = stripe.wake_seq.fetchAdd(1, .seq_cst);
-    if (stripe.num_waiters.load(.seq_cst) == 0) return;
+    // Single-word modifying `.seq_cst` RMW increments high 32-bit epoch and reads
+    // low 32-bit waiter count in one indivisible modification-order step.
+    const prev = stripe.state.fetchAdd(wake_epoch_inc, .seq_cst);
+    if (@as(u32, @truncate(prev)) == 0) {
+        @branchHint(.likely);
+        return;
+    }
 
     var detached_head: ?*Waiter = null;
     var detached_tail: ?*Waiter = null;
-    var removed: usize = 0;
+    var removed: u64 = 0;
     const kio = kernelIo();
 
     {
@@ -168,7 +181,7 @@ pub fn wake(self: *FutexTable, ptr: *const u32, max_waiters: u32) void {
             cur = next;
         }
         if (removed > 0) {
-            _ = stripe.num_waiters.fetchSub(removed, .monotonic);
+            _ = stripe.state.fetchSub(removed, .monotonic);
         }
         stripe.mutex.unlock(kio);
     }
@@ -182,7 +195,7 @@ pub fn wake(self: *FutexTable, ptr: *const u32, max_waiters: u32) void {
     }
 }
 
-test "FutexTable fast-path mismatch, FIFO partial wake, and unpark race verdict" {
+test "FutexTable single-word RMW fast-path mismatch, FIFO partial wake, and unpark race verdict" {
     var table: FutexTable = .init;
     var word: u32 align(4) = 1;
 
@@ -205,7 +218,7 @@ test "FutexTable fast-path mismatch, FIFO partial wake, and unpark race verdict"
 
     var st: State = .{};
     var h1: Hook = .{ .st = &st, .id = 10, .waiter = .{ .ptr = &word, .expected = 0, .owner_ctx = null, .wake_fn = Hook.onWake } };
-    // Value is 1 != expected 0 -> does not park.
+    // Value is 1 != expected 0 -> does not park and restores low-32 waiter count to 0.
     try std.testing.expect(!table.tryPark(&h1.waiter));
 
     h1.waiter.expected = 1;
@@ -216,14 +229,12 @@ test "FutexTable fast-path mismatch, FIFO partial wake, and unpark race verdict"
     try std.testing.expect(table.tryPark(&h2.waiter));
     try std.testing.expect(table.tryPark(&h3.waiter));
 
-    // Unpark h2 before wake
     try std.testing.expect(table.unpark(&h2.waiter));
     try std.testing.expect(!table.unpark(&h2.waiter));
 
     @atomicStore(u32, &word, 2, .release);
     table.wake(&word, 1);
     try std.testing.expectEqualSlices(u32, &.{10}, st.woken_order[0..st.len]);
-    // h1 was already detached by wake -> unpark returns false!
     try std.testing.expect(!table.unpark(&h1.waiter));
 
     table.wake(&word, 10);

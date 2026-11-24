@@ -650,8 +650,44 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                     n_bufs += 1;
                 }
             }
-            if (n_bufs == 0) return .{ .net_read = .{ .data_len = 0 } };
+            if (n_bufs == 0 and o.control.len == 0) return .{ .net_read = .{ .data_len = 0 } };
             const sock = win32.handleToSocket(o.socket_handle);
+            if (o.control.len > 0) {
+                const recv_msg = Iocp.resolveWsaRecvMsg(sock) catch return .{ .net_read = error.Unexpected };
+                var wmsg: win32.WSAMSG = .{
+                    .name = null,
+                    .namelen = 0,
+                    .lpBuffers = &bufs,
+                    .dwBufferCount = n_bufs,
+                    .Control = .{
+                        .len = @intCast(@min(o.control.len, std.math.maxInt(u32))),
+                        .buf = o.control.ptr,
+                    },
+                    .dwFlags = 0,
+                };
+                var sync_bytes: win32.DWORD = 0;
+                var comp: Iocp.Completion = .{ .callback = undefined };
+                const rc = recv_msg(sock, &wmsg, &sync_bytes, &comp.overlapped, null);
+                const final_bytes: u32 = if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle))
+                    sync_bytes
+                else blk: {
+                    if (rc == win32.SOCKET_ERROR) {
+                        const werr = win32.WSAGetLastError();
+                        if (werr != win32.WSA_IO_PENDING) return .{ .net_read = mapNetReadError(werr) };
+                    }
+                    self.poller.recordPending(&comp);
+                    const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
+                    if (res.nt_status != .SUCCESS) {
+                        return .{ .net_read = mapNetReadError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
+                    }
+                    break :blk res.bytes;
+                };
+                return .{ .net_read = .{
+                    .data_len = final_bytes,
+                    .control_len = @intCast(wmsg.Control.len),
+                    .control_truncated = (wmsg.dwFlags & win32.ws2_32.MSG.CTRUNC) != 0,
+                } };
+            }
             var flags: win32.DWORD = 0;
             var sync_bytes: win32.DWORD = 0;
             var comp: Iocp.Completion = .{ .callback = undefined };
@@ -677,8 +713,37 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             var bufs: [Threaded.max_iovecs_len]win32.WSABUF = undefined;
             var splat_buf: [Threaded.splat_buffer_size]u8 = undefined;
             const n_bufs = fillWriteWsabufs(&bufs, &splat_buf, o.header, o.data, o.splat);
-            if (n_bufs == 0) return .{ .net_write = 0 };
+            if (n_bufs == 0 and o.control.len == 0) return .{ .net_write = 0 };
             const sock = win32.handleToSocket(o.socket_handle);
+            if (o.control.len > 0) {
+                var wmsg: win32.WSAMSG = .{
+                    .name = null,
+                    .namelen = 0,
+                    .lpBuffers = &bufs,
+                    .dwBufferCount = n_bufs,
+                    .Control = .{
+                        .len = @intCast(@min(o.control.len, std.math.maxInt(u32))),
+                        .buf = @constCast(o.control.ptr),
+                    },
+                    .dwFlags = 0,
+                };
+                var sync_bytes: win32.DWORD = 0;
+                var comp: Iocp.Completion = .{ .callback = undefined };
+                const rc = win32.WSASendMsg(sock, &wmsg, 0, &sync_bytes, &comp.overlapped, null);
+                if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
+                    return .{ .net_write = sync_bytes };
+                }
+                if (rc == win32.SOCKET_ERROR) {
+                    const werr = win32.WSAGetLastError();
+                    if (werr != win32.WSA_IO_PENDING) return .{ .net_write = mapNetWriteError(werr) };
+                }
+                self.poller.recordPending(&comp);
+                const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
+                if (res.nt_status != .SUCCESS) {
+                    return .{ .net_write = mapNetWriteError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
+                }
+                return .{ .net_write = res.bytes };
+            }
             var sync_bytes: win32.DWORD = 0;
             var comp: Iocp.Completion = .{ .callback = undefined };
             const rc = win32.WSASend(sock, &bufs, n_bufs, &sync_bytes, 0, &comp.overlapped, null);

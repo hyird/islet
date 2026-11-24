@@ -214,6 +214,7 @@ fn waitFd(
         waiter: Epoll.Waiter = undefined,
         timer_token: TimerHeap.Token = .inactive,
         done: bool = false,
+        woken_by_io: bool = false,
         timed_out: bool = false,
         canceled: bool = false,
 
@@ -224,6 +225,7 @@ fn waitFd(
                 _ = st.shard_ptr.timers.cancel(st.timer_token);
                 st.timer_token = .inactive;
             }
+            st.woken_by_io = true;
             st.done = true;
             st.task.cancel_hook = null;
             st.shard_ptr.enqueueReady(st.task);
@@ -283,7 +285,11 @@ fn waitFd(
         shard.suspendCurrent();
     }
 
-    if (st.canceled) {
+    if (st.canceled or cur.shouldCancelNow()) {
+        if (st.woken_by_io) {
+            // Pass the `EPOLLET` readiness baton to any sibling waiter queued behind us!
+            self.poller.cascadeNext(fd, dir);
+        }
         if (cur.shouldCancelNow()) cur.acknowledgeCancel();
         return error.Canceled;
     }
@@ -1658,13 +1664,31 @@ pub fn netAccept(
                     else => return error.Unexpected,
                 };
             },
-            .CONNABORTED => return error.ConnectionAborted,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOMEM, .NOBUFS => return error.SystemResources,
+            .CONNABORTED => {
+                self.poller.cascadeNext(server, .read);
+                return error.ConnectionAborted;
+            },
+            .MFILE => {
+                self.poller.cascadeNext(server, .read);
+                return error.ProcessFdQuotaExceeded;
+            },
+            .NFILE => {
+                self.poller.cascadeNext(server, .read);
+                return error.SystemFdQuotaExceeded;
+            },
+            .NOMEM, .NOBUFS => {
+                self.poller.cascadeNext(server, .read);
+                return error.SystemResources;
+            },
             .INVAL => return error.SocketNotListening,
-            .PERM => return error.BlockedByFirewall,
-            .PROTO => return error.ProtocolFailure,
+            .PERM => {
+                self.poller.cascadeNext(server, .read);
+                return error.BlockedByFirewall;
+            },
+            .PROTO => {
+                self.poller.cascadeNext(server, .read);
+                return error.ProtocolFailure;
+            },
             .NETDOWN => return error.NetworkDown,
             else => |err| return posix.unexpectedErrno(err),
         }

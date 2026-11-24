@@ -941,3 +941,241 @@ test "Round 2 E2E: nested Future.await cancel propagation, reentrant stderr, zer
         }
     }
 }
+
+test "Round 3 E2E: Batch.awaitAsync partial OOM progress, Group multi-round reuse, zero-hop inline descriptor ops, and EPOLLET baton cascade" {
+    const Guard = struct {
+        backing: std.mem.Allocator,
+        forbid: bool = false,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid) return null;
+            return self.backing.rawAlloc(len, alignment, ret);
+        }
+        fn resize(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid and new_len > mem.len) return false;
+            return self.backing.rawResize(mem, alignment, new_len, ret);
+        }
+        fn remap(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.forbid and new_len > mem.len) return null;
+            return self.backing.rawRemap(mem, alignment, new_len, ret);
+        }
+        fn free(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(mem, alignment, ret);
+        }
+    };
+
+    var guard: Guard = .{ .backing = std.testing.allocator };
+    var shard: Shard = undefined;
+    try shard.init(guard.allocator(), .{
+        .max_cached_stacks = 2,
+        .blocking_threads = 1,
+        .blocking_queue_capacity = 2,
+    });
+    defer shard.deinit();
+    const io = shard.io();
+
+    // 1. `Io.Group` multi-round reuse (`cancel` -> reuse -> `await`):
+    {
+        var grp: Io.Group = .init;
+        var ev: Io.Event = .unset;
+        var ran_second: usize = 0;
+
+        try grp.concurrent(io, struct {
+            fn stuck(t_io: Io, e: *Io.Event) Io.Cancelable!void {
+                try e.wait(t_io);
+            }
+        }.stuck, .{ io, &ev });
+        grp.cancel(io);
+
+        // Reuse the EXACT same `Io.Group` instance for a second round:
+        try grp.concurrent(io, struct {
+            fn second(_: Io, cnt: *usize) Io.Cancelable!void {
+                cnt.* += 1;
+            }
+        }.second, .{ io, &ran_second });
+        try grp.await(io);
+        try std.testing.expectEqual(@as(usize, 1), ran_second);
+    }
+
+    // 2. `Batch.awaitAsync` partial `submitBatch` progress without hanging on unsubmitted tail:
+    if (builtin.os.tag == .linux) {
+        const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const warm_rx = try lo.bind(io, .{ .mode = .dgram });
+        defer warm_rx.close(io);
+        const tx = try lo.bind(io, .{ .mode = .dgram });
+        defer tx.close(io);
+
+        // Warm `Epoll.slots` for `warm_rx`:
+        {
+            var wst: [1]Io.Operation.Storage = undefined;
+            var wb: Io.Batch = .init(&wst);
+            defer wb.cancel(io);
+            var wm: [1]Io.net.IncomingMessage = .{.init};
+            var wbuf: [8]u8 = undefined;
+            _ = wb.add(.{ .net_receive = .{
+                .socket_handle = warm_rx.handle,
+                .message_buffer = &wm,
+                .data_buffer = &wbuf,
+                .flags = .{},
+            } });
+            try std.testing.expectError(error.Timeout, wb.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }));
+        }
+
+        // Open unseen higher-fd sockets that have NOT grown `Epoll.slots` yet:
+        var unseen: [16]Io.net.Socket = undefined;
+        var n_unseen: usize = 0;
+        defer for (unseen[0..n_unseen]) |*s| s.close(io);
+        while (n_unseen < unseen.len) : (n_unseen += 1) {
+            unseen[n_unseen] = try lo.bind(io, .{ .mode = .dgram });
+        }
+
+        guard.forbid = true;
+        defer guard.forbid = false;
+
+        var st: [2]Io.Operation.Storage = undefined;
+        var batch: Io.Batch = .init(&st);
+        defer batch.cancel(io);
+
+        var m0: [1]Io.net.IncomingMessage = .{.init};
+        var b0: [16]u8 = undefined;
+        var m1: [1]Io.net.IncomingMessage = .{.init};
+        var b1: [16]u8 = undefined;
+
+        // Op 0 parks in `batch.pending` (warm fd), Op 1 fails `Epoll.slots` alloc (`ConcurrencyUnavailable`)
+        // and stays in `batch.submitted` (never receives any packet!).
+        _ = batch.add(.{ .net_receive = .{
+            .socket_handle = warm_rx.handle,
+            .message_buffer = &m0,
+            .data_buffer = &b0,
+            .flags = .{},
+        } });
+        _ = batch.add(.{ .net_receive = .{
+            .socket_handle = unseen[unseen.len - 1].handle,
+            .message_buffer = &m1,
+            .data_buffer = &b1,
+            .flags = .{},
+        } });
+
+        try tx.send(io, &warm_rx.address, "op0-done");
+        // `awaitAsync` MUST return Op 0 immediately without blocking on never-ready Op 1!
+        try batch.awaitAsync(io);
+        const c0 = batch.next().?;
+        try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, null), c0.result.net_receive[0]);
+        try std.testing.expectEqualStrings("op0-done", m0[0].data);
+        batch.cancel(io);
+    }
+
+    // 3. Zero-hop inline descriptor & process operations (`seekTo`, `seekBy`, `tryLock`, `unlock`, `currentPath`)
+    //    complete instantaneously even while the sole `BlockingPool` worker thread is 100% occupied!
+    {
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(io, ".zig-cache/islet-r3-test");
+        defer cwd.deleteDir(io, ".zig-cache/islet-r3-test") catch {};
+        const fpath = ".zig-cache/islet-r3-test/lockseek.bin";
+        defer cwd.deleteFile(io, fpath) catch {};
+
+        const f = try cwd.createFile(io, fpath, .{ .truncate = true, .read = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, "abcdefgh", 0);
+
+        // Pin the ONLY `BlockingPool` worker inside a gate until we finish all inline ops!
+        const Blocker = struct {
+            entered: Io.Event = .unset,
+            release: Io.Event = .unset,
+
+            fn hold(_: *Io.Threaded, self: *@This()) void {
+                const kio = Io.Threaded.global_single_threaded.io();
+                self.entered.set(kio);
+                self.release.waitUncancelable(kio);
+            }
+
+            fn fiberEntry(s: *Shard, self: *@This()) void {
+                s.callBlocking(false, hold, .{self});
+            }
+        };
+        var blk_st: Blocker = .{};
+        var holder = try io.concurrent(Blocker.fiberEntry, .{ &shard, &blk_st });
+        defer {
+            blk_st.release.set(Io.Threaded.global_single_threaded.io());
+            holder.await(io);
+        }
+        while (!blk_st.entered.isSet()) {
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+
+        // All of these MUST execute inline in ~80ns without touching the blocked worker!
+        try io.vtable.fileSeekTo(io.userdata, f, 4);
+        try io.vtable.fileSeekBy(io.userdata, f, -2);
+        if (try f.tryLock(io, .exclusive)) {
+            f.unlock(io);
+        }
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_len = try std.process.currentPath(io, &cwd_buf);
+        try std.testing.expect(cwd_len > 0);
+    }
+
+    // 4. Multi-waiter `EPOLLET` baton cascade when front reader is canceled after readiness:
+    if (builtin.os.tag == .linux) {
+        const pair = try Io.net.Socket.createPair(io, .{ .mode = .stream });
+        defer pair[0].close(io);
+        defer pair[1].close(io);
+
+        const Readers = struct {
+            fd: Io.net.Socket.Handle,
+            r1_parked: Io.Event = .unset,
+            r2_parked: Io.Event = .unset,
+            r2_bytes: usize = 0,
+
+            fn r1(t_io: Io, self: *@This()) Io.Cancelable!void {
+                self.r1_parked.set(t_io);
+                var buf: [8]u8 = undefined;
+                var slices = [_][]u8{&buf};
+                const res = try t_io.operate(.{ .net_read = .{ .socket_handle = self.fd, .data = &slices } });
+                _ = res.net_read catch {};
+            }
+
+            fn r2(t_io: Io, self: *@This()) Io.Cancelable!void {
+                self.r2_parked.set(t_io);
+                var buf: [8]u8 = undefined;
+                var slices = [_][]u8{&buf};
+                const res = try t_io.operate(.{ .net_read = .{ .socket_handle = self.fd, .data = &slices } });
+                const out = res.net_read catch return;
+                self.r2_bytes = out.data_len;
+            }
+        };
+
+        var rst: Readers = .{ .fd = pair[0].handle };
+        var f1 = try io.concurrent(Readers.r1, .{ io, &rst });
+        try rst.r1_parked.wait(io);
+        try io.sleep(.fromMilliseconds(1), .awake);
+
+        var f2 = try io.concurrent(Readers.r2, .{ io, &rst });
+        try rst.r2_parked.wait(io);
+        try io.sleep(.fromMilliseconds(1), .awake);
+
+        // Cancel `f1` and send 5 bytes: `f2` must receive the payload without hanging!
+        try std.testing.expectError(error.Canceled, f1.cancel(io));
+        const msg = "baton";
+        const wres = try io.operate(.{ .net_write = .{
+            .socket_handle = pair[1].handle,
+            .header = msg,
+            .data = &.{},
+            .splat = 0,
+        } });
+        try std.testing.expectEqual(@as(usize, 5), try wres.net_write);
+        try f2.await(io);
+        try std.testing.expectEqual(@as(usize, 5), rst.r2_bytes);
+    }
+}

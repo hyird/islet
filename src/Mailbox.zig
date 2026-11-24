@@ -154,70 +154,75 @@ pub fn Mailbox(comptime T: type) type {
             return self.published_seq.load(.seq_cst) == 0;
         }
 
-        /// Splices all ready nodes in O(1) under the mutex, then invokes `handler`
-        /// on each payload completely outside the mutex before returning the node
-        /// to the free list.
+        /// Splices all ready nodes in O(1) under the mutex, invokes `handler` on
+        /// every payload outside the mutex, and returns the entire physical node
+        /// chain to `free_head` in a single O(1) splice (`2 * capacity` nodes
+        /// guarantee full concurrent admission capacity while draining).
         pub fn drain(self: *Self, ctx: ?*anyopaque, handler: *const fn (?*anyopaque, T) void) usize {
             const kio = kernelIo();
             var batch_head: u32 = no_node;
+            var batch_tail: u32 = no_node;
             var batch_len: u32 = 0;
             {
                 self.mutex.lockUncancelable(kio);
                 batch_head = self.ready_head;
                 if (batch_head != no_node) {
+                    batch_tail = self.ready_tail;
                     self.ready_head = no_node;
                     self.ready_tail = no_node;
-                    // Count spliced nodes while detaching; typically small bounded batch.
                     var cur = batch_head;
                     while (cur != no_node) : (cur = self.nodes[cur].next) {
                         batch_len += 1;
                     }
+                    self.pending_count -= batch_len;
                     _ = self.published_seq.fetchSub(batch_len, .seq_cst);
                 }
                 self.mutex.unlock(kio);
             }
             if (batch_head == no_node) return 0;
+            defer self.releaseChain(batch_head, batch_tail);
 
-            var count: usize = 0;
             var cur = batch_head;
             while (cur != no_node) {
                 const next = self.nodes[cur].next;
                 const value = self.nodes[cur].payload;
-                self.releaseNode(cur);
-                count += 1;
                 handler(ctx, value);
                 cur = next;
             }
-            return count;
+            return batch_len;
         }
 
         fn drainAllWith(self: *Self, cleanup: *const fn (*T) void) void {
             const kio = kernelIo();
             var batch_head: u32 = no_node;
+            var batch_tail: u32 = no_node;
             {
                 self.mutex.lockUncancelable(kio);
                 batch_head = self.ready_head;
+                batch_tail = self.ready_tail;
                 self.ready_head = no_node;
                 self.ready_tail = no_node;
+                self.pending_count = 0;
                 self.published_seq.store(0, .seq_cst);
                 self.mutex.unlock(kio);
             }
+            if (batch_head == no_node) return;
+            defer self.releaseChain(batch_head, batch_tail);
+
             var cur = batch_head;
             while (cur != no_node) {
                 const next = self.nodes[cur].next;
                 var value = self.nodes[cur].payload;
-                self.releaseNode(cur);
                 cleanup(&value);
                 cur = next;
             }
         }
 
-        fn releaseNode(self: *Self, index: u32) void {
+        fn releaseChain(self: *Self, chain_head: u32, chain_tail: u32) void {
             const kio = kernelIo();
             self.mutex.lockUncancelable(kio);
-            self.nodes[index].next = self.free_head;
-            self.free_head = index;
-            self.pending_count -= 1;
+            self.nodes[chain_tail].next = self.free_head;
+            self.free_head = chain_head;
             self.mutex.unlock(kio);
         }
     };

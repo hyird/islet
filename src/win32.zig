@@ -116,13 +116,6 @@ pub extern "kernel32" fn WriteFile(
     lpOverlapped: ?*OVERLAPPED,
 ) callconv(.winapi) BOOL;
 
-pub extern "kernel32" fn GetOverlappedResult(
-    hFile: HANDLE,
-    lpOverlapped: *OVERLAPPED,
-    lpNumberOfBytesTransferred: *DWORD,
-    bWait: BOOL,
-) callconv(.winapi) BOOL;
-
 // ── Win32 Fibers (`kernel32`) ────────────────────────────────────────────────
 
 pub const FIBER_FLAG_FLOAT_SWITCH: DWORD = 0x1;
@@ -323,7 +316,6 @@ pub const LPFN_WSARECVMSG = *const fn (
 ) callconv(.winapi) c_int;
 
 pub extern "ws2_32" fn WSAStartup(wVersionRequested: WORD, lpWSAData: *WSADATA) callconv(.winapi) c_int;
-pub extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
 pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
 pub extern "ws2_32" fn WSASocketW(
     af: c_int,
@@ -406,14 +398,6 @@ pub extern "ws2_32" fn WSAIoctl(
     lpOverlapped: ?*OVERLAPPED,
     lpCompletionRoutine: ?LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) callconv(.winapi) c_int;
-
-pub extern "ws2_32" fn WSAGetOverlappedResult(
-    s: SOCKET,
-    lpOverlapped: *OVERLAPPED,
-    lpcbTransfer: *DWORD,
-    fWait: BOOL,
-    lpdwFlags: *DWORD,
-) callconv(.winapi) BOOL;
 
 pub inline fn socketToHandle(s: SOCKET) HANDLE {
     assert(s != INVALID_SOCKET);

@@ -1,14 +1,10 @@
-//! Single-thread Shared-Nothing `std.Io` shard scheduler and full `VTable` orchestrator.
+//! Single-thread Shared-Nothing `std.Io` shard scheduler and `VTable` orchestrator.
 //!
-//! Design invariants (AGENTS.md §2, §3, §4, §5):
 //! - Strictly single-thread affine (`tls_current_shard == self` O(1) check on every
 //!   `VTable` entry except `futexWake`, which may be invoked from any thread).
-//! - Zero platform conditional scatter: all OS-specific multiplexer and socket
-//!   state machines reside in `LinuxIo` / `WindowsIo`.
+//! - All OS-specific multiplexer and socket state machines live in `LinuxIo` / `WindowsIo`.
 //! - Bounded `lifo_slot` (`max_lifo_streak = 3`) paired with FIFO `ready_queue`
-//!   maximizes L1/L2 cache locality on same-Shard ping-pong wakeups without
-//!   starving queued tasks, while `steps_since_poll` throttles nonblocking I/O
-//!   polls across both direct Fiber switches and `idle_fiber` transitions.
+//!   preserves cache locality on same-Shard wakeups without starving queued tasks.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -52,7 +48,6 @@ pub const InitOptions = struct {
 
 pub const SharedServices = struct {
     shard_id: usize,
-    shard_count: usize,
     runtime_ptr: *const anyopaque,
     blocking_pool: *BlockingPool,
     futex_table: *FutexTable,
@@ -95,41 +90,39 @@ pub const CancelHook = struct {
     trigger: *const fn (*Shard, *anyopaque) void,
 };
 
-const TaskKind = enum {
-    main,
-    future,
-    group,
-};
-
 pub const Task = struct {
+    pub const FutureState = struct {
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        awaiter: ?*Task = null,
+        result_ptr: [*]u8,
+        result_alloc: ?[]u8 = null,
+        result_align: Alignment = .@"1",
+    };
+
+    pub const GroupState = struct {
+        start: *const fn (context: *const anyopaque) void,
+        owner: ?*Io.Group = null,
+        prev: ?*Task = null,
+        next: ?*Task = null,
+    };
+
+    pub const Role = union(enum) {
+        main,
+        future: FutureState,
+        group: GroupState,
+    };
+
     raw: ?*fiber.RawFiber = null,
-    kind: TaskKind,
+    role: Role,
     ready_next: ?*Task = null,
     queued_ready: bool = false,
     finished: bool = false,
     cancel_requested: bool = false,
     cancel_protection: CancelProtectionState = .{},
     cancel_hook: ?CancelHook = null,
-
-    start_fn: union {
-        none: void,
-        future: *const fn (context: *const anyopaque, result: *anyopaque) void,
-        group: *const fn (context: *const anyopaque) void,
-    } = .{ .none = {} },
-
-    // `Future` linkage & storage
-    awaiter: ?*Task = null,
     context_ptr: [*]u8 = undefined,
     context_alloc: ?[]u8 = null,
     context_align: Alignment = .@"1",
-    result_ptr: [*]u8 = undefined,
-    result_alloc: ?[]u8 = null,
-    result_align: Alignment = .@"1",
-
-    // `Group` intrusive doubly-linked list
-    group_owner: ?*Io.Group = null,
-    group_prev: ?*Task = null,
-    group_next: ?*Task = null,
 
     pub fn shouldCancelNow(self: *const Task) bool {
         return self.cancel_requested and self.cancel_protection.effective() == .unblocked;
@@ -137,6 +130,10 @@ pub const Task = struct {
 
     pub fn acknowledgeCancel(self: *Task) void {
         self.cancel_protection.acknowledge();
+    }
+
+    pub fn recancel(self: *Task) void {
+        self.cancel_protection.recancel();
     }
 
     fn requestCancel(self: *Task, shard: *Shard) void {
@@ -183,7 +180,6 @@ const ReadyQueue = struct {
 
 gpa: Allocator,
 id: usize,
-shard_count: usize,
 runtime_ptr: *const anyopaque,
 
 driver: PlatformIo = undefined,
@@ -198,7 +194,7 @@ stderr_mutex: *Io.Mutex,
 
 thread_ctx: fiber.ThreadContext = undefined,
 idle_fiber: *fiber.RawFiber = undefined,
-main_task: Task = .{ .kind = .main },
+main_task: Task = .{ .role = .main },
 current_task: *Task = undefined,
 lifo_slot: ?*Task = null,
 lifo_streak: u8 = 0,
@@ -233,7 +229,6 @@ pub fn init(
     self.* = .{
         .gpa = gpa,
         .id = services.shard_id,
-        .shard_count = services.shard_count,
         .runtime_ptr = services.runtime_ptr,
         .stack_pool = fiber.StackPool.init(options.stack_size, options.max_cached_stacks),
         .blocking_pool = services.blocking_pool,
@@ -241,7 +236,6 @@ pub fn init(
         .mesh = services.mesh,
         .stderr_mutex = services.stderr_mutex,
     };
-    self.stop_node.ctx = self;
 
     // Initialize `driver` in-place after `self.*` is address-pinned!
     try self.driver.init(
@@ -269,7 +263,7 @@ pub fn attachCurrentThread(self: *Shard) AttachError!void {
     idle_raw.arm(idleFiberEntry, self);
     idle_raw.exit_target = &self.thread_ctx.ctx;
     self.idle_fiber = idle_raw;
-    self.main_task = .{ .kind = .main };
+    self.main_task = .{ .role = .main };
     self.current_task = &self.main_task;
     self.attached_to_thread = true;
     tls_current_shard = self;
@@ -284,6 +278,7 @@ pub fn detachCurrentThread(self: *Shard) void {
     if (self.active_tasks != 0) {
         @panic("islet.Shard: active Future or Group tasks were not awaited or canceled");
     }
+    self.driver.assertQuiescent();
 
     self.timers.cancelAll();
     self.drainIncoming();
@@ -336,21 +331,15 @@ fn onDriverWakeTask(owner_ctx: *anyopaque, task_ptr: *anyopaque) void {
 }
 
 fn onStopResumeNode(node: *ResumeLane.Node) void {
-    const self: *Shard = @ptrCast(@alignCast(node.ctx.?));
+    const self: *Shard = @alignCast(@fieldParentPtr("stop_node", node));
     self.driver.onStopRequested();
+    self.main_task.requestCancel(self);
 }
 
 /// Returns the `std.Io` instance bound to this Shard.
 /// Must be called on this Shard's owning OS thread (`@panic` otherwise).
-pub fn io(self: *Shard) Io {
+pub inline fn io(self: *Shard) Io {
     self.assertAffinity();
-    return .{
-        .userdata = self,
-        .vtable = &vtable,
-    };
-}
-
-inline fn ioUnchecked(self: *Shard) Io {
     return .{
         .userdata = self,
         .vtable = &vtable,
@@ -496,9 +485,10 @@ fn idleFiberEntry(arg: *anyopaque) void {
             continue;
         }
 
-        // Scavenge cold physical stack pages and excess idle timer slots before sleeping.
+        // Scavenge cold physical stack pages, idle timer slots, and driver handle tables before sleeping.
         self.stack_pool.scavengeIdle();
         self.timers.scavengeIdle(self.gpa);
+        self.driver.scavengeIdle(self.gpa);
 
         // Arm coalesced doorbell BEFORE final `.seq_cst` emptiness check.
         self.driver.armDoorbell();
@@ -585,14 +575,9 @@ fn vtableCheckCancel(userdata: ?*anyopaque) Io.Cancelable!void {
 
 // ── VTable: `Future` (`async` / `concurrent` / `await` / `cancel`) ──────────
 
-const TaskRunArg = struct {
-    shard: *Shard,
-    task: *Task,
-};
-
 fn spawnTaskFiber(
     self: *Shard,
-    kind: TaskKind,
+    comptime is_group: bool,
     result_len: usize,
     result_alignment: Alignment,
     context: []const u8,
@@ -605,8 +590,7 @@ fn spawnTaskFiber(
     const header_end = header_base + fiber.header_capacity;
 
     const task_addr = Alignment.of(Task).forward(header_base);
-    const run_arg_addr = Alignment.of(TaskRunArg).forward(task_addr + @sizeOf(Task));
-    var cursor = run_arg_addr + @sizeOf(TaskRunArg);
+    var cursor = task_addr + @sizeOf(Task);
 
     var result_alloc: ?[]u8 = null;
     errdefer if (result_alloc) |s| self.gpa.rawFree(s, result_alignment, @returnAddress());
@@ -647,19 +631,20 @@ fn spawnTaskFiber(
     const task: *Task = @ptrFromInt(task_addr);
     task.* = .{
         .raw = raw,
-        .kind = kind,
+        .role = if (is_group) .{ .group = .{
+            .start = undefined,
+        } } else .{ .future = .{
+            .start = undefined,
+            .result_ptr = result_ptr,
+            .result_alloc = result_alloc,
+            .result_align = result_alignment,
+        } },
         .context_ptr = context_ptr,
         .context_alloc = context_alloc,
         .context_align = context_alignment,
-        .result_ptr = result_ptr,
-        .result_alloc = result_alloc,
-        .result_align = result_alignment,
     };
 
-    const run_arg: *TaskRunArg = @ptrFromInt(run_arg_addr);
-    run_arg.* = .{ .shard = self, .task = task };
-    raw.arm(taskFiberEntry, run_arg);
-
+    raw.arm(taskFiberEntry, task);
     return task;
 }
 
@@ -675,15 +660,14 @@ fn selectExitTarget(self: *Shard) *fiber.ExecContext {
 }
 
 fn taskFiberEntry(arg: *anyopaque) void {
-    const run_arg: *TaskRunArg = @ptrCast(@alignCast(arg));
-    const self = run_arg.shard;
-    const task = run_arg.task;
+    const task: *Task = @ptrCast(@alignCast(arg));
+    const self = tls_current_shard.?;
     self.reclaimPendingFiber();
 
-    switch (task.kind) {
+    switch (task.role) {
         .main => unreachable,
-        .future => task.start_fn.future(task.context_ptr, task.result_ptr),
-        .group => task.start_fn.group(task.context_ptr),
+        .future => |f| f.start(task.context_ptr, f.result_ptr),
+        .group => |g| g.start(task.context_ptr),
     }
     if (task.context_alloc) |ctx_slice| {
         self.gpa.rawFree(ctx_slice, task.context_align, @returnAddress());
@@ -691,11 +675,11 @@ fn taskFiberEntry(arg: *anyopaque) void {
     }
     task.finished = true;
 
-    switch (task.kind) {
+    switch (task.role) {
         .main => unreachable,
-        .future => {
-            if (task.awaiter) |awaiter| {
-                task.awaiter = null;
+        .future => |*f| {
+            if (f.awaiter) |awaiter| {
+                f.awaiter = null;
                 self.enqueueReady(awaiter);
             }
             // `Future` raw fiber stays alive until `vtableAwait` copies `result` out!
@@ -738,7 +722,7 @@ fn vtableAsync(
         cur.cancel_requested = false;
         cur.cancel_protection = .{};
         defer {
-            cur.cancel_requested = saved_req;
+            cur.cancel_requested = saved_req or cur.cancel_requested;
             cur.cancel_protection = saved_prot;
         }
         start(context.ptr, result.ptr);
@@ -755,8 +739,8 @@ fn vtableConcurrent(
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
     const self = fromUserdata(userdata);
-    const task = try self.spawnTaskFiber(.future, result_len, result_alignment, context, context_alignment);
-    task.start_fn = .{ .future = start };
+    const task = try self.spawnTaskFiber(false, result_len, result_alignment, context, context_alignment);
+    task.role.future.start = start;
     self.active_tasks += 1;
     self.enqueueReady(task);
     return @ptrCast(task);
@@ -771,7 +755,7 @@ fn vtableAwait(
     _ = result_alignment;
     const self = fromUserdata(userdata);
     const child: *Task = @ptrCast(@alignCast(any_future));
-    assert(child.kind == .future);
+    assert(child.role == .future);
 
     const cur = self.current_task;
     if (!child.finished) {
@@ -808,7 +792,7 @@ fn vtableAwait(
             defer cur.cancel_hook = null;
 
             while (!child.finished) {
-                child.awaiter = cur;
+                child.role.future.awaiter = cur;
                 self.suspendCurrent();
             }
         }
@@ -823,12 +807,13 @@ fn vtableAwait(
         }
     }
 
+    const fut = &child.role.future;
     if (result.len > 0) {
-        @memcpy(result, child.result_ptr[0..result.len]);
+        @memcpy(result, fut.result_ptr[0..result.len]);
     }
-    if (child.result_alloc) |res_slice| {
-        self.gpa.rawFree(res_slice, child.result_align, @returnAddress());
-        child.result_alloc = null;
+    if (fut.result_alloc) |res_slice| {
+        self.gpa.rawFree(res_slice, fut.result_align, @returnAddress());
+        fut.result_alloc = null;
     }
     const raw = child.raw.?;
     assert(self.active_tasks > 0);
@@ -844,7 +829,7 @@ fn vtableCancel(
 ) void {
     const self = fromUserdata(userdata);
     const child: *Task = @ptrCast(@alignCast(any_future));
-    assert(child.kind == .future);
+    assert(child.role == .future);
     child.requestCancel(self);
     const prev = vtableSwapCancelProtection(self, .blocked);
     defer _ = vtableSwapCancelProtection(self, prev);
@@ -857,11 +842,12 @@ const group_cancel_bit: usize = 1;
 const group_ptr_mask: usize = ~@as(usize, 3);
 
 fn linkGroupTask(g: *Io.Group, task: *Task) void {
-    task.group_owner = g;
+    const gs = &task.role.group;
+    gs.owner = g;
     const old_head: ?*Task = @ptrCast(@alignCast(g.token.raw));
-    task.group_prev = null;
-    task.group_next = old_head;
-    if (old_head) |h| h.group_prev = task;
+    gs.prev = null;
+    gs.next = old_head;
+    if (old_head) |h| h.role.group.prev = task;
     if ((g.state & group_cancel_bit) != 0) {
         task.cancel_requested = true;
     }
@@ -869,13 +855,14 @@ fn linkGroupTask(g: *Io.Group, task: *Task) void {
 }
 
 fn unlinkGroupTask(self: *Shard, task: *Task) void {
-    const g = task.group_owner.?;
-    if (task.group_prev) |p| {
-        p.group_next = task.group_next;
+    const gs = &task.role.group;
+    const g = gs.owner.?;
+    if (gs.prev) |p| {
+        p.role.group.next = gs.next;
     } else {
-        const next_head = task.group_next;
+        const next_head = gs.next;
         if (next_head) |nh| {
-            nh.group_prev = null;
+            nh.role.group.prev = null;
             g.token.store(nh, .release);
         } else {
             const awaiter: ?*Task = @ptrFromInt(g.state & group_ptr_mask);
@@ -887,19 +874,19 @@ fn unlinkGroupTask(self: *Shard, task: *Task) void {
             }
         }
     }
-    if (task.group_next) |n| {
-        n.group_prev = task.group_prev;
+    if (gs.next) |n| {
+        n.role.group.prev = gs.prev;
     }
-    task.group_prev = null;
-    task.group_next = null;
-    task.group_owner = null;
+    gs.prev = null;
+    gs.next = null;
+    gs.owner = null;
 }
 
 fn cancelGroupMembers(self: *Shard, g: *Io.Group) void {
     g.state |= group_cancel_bit;
     var cur: ?*Task = @ptrCast(@alignCast(g.token.raw));
     while (cur) |t| {
-        const next = t.group_next;
+        const next = t.role.group.next;
         t.requestCancel(self);
         cur = next;
     }
@@ -915,12 +902,14 @@ fn vtableGroupAsync(
     vtableGroupConcurrent(userdata, group, context, context_alignment, start) catch {
         const self = fromUserdata(userdata);
         const cur = self.current_task;
+        const group_pre_canceled = (group.state & group_cancel_bit) != 0;
         const saved_req = cur.cancel_requested;
         const saved_prot = cur.cancel_protection;
-        cur.cancel_requested = (group.state & group_cancel_bit) != 0;
+        cur.cancel_requested = group_pre_canceled;
         cur.cancel_protection = .{};
         defer {
-            cur.cancel_requested = saved_req;
+            const canceled_during = !group_pre_canceled and cur.cancel_requested;
+            cur.cancel_requested = saved_req or canceled_during;
             cur.cancel_protection = saved_prot;
         }
         start(context.ptr);
@@ -935,8 +924,8 @@ fn vtableGroupConcurrent(
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
     const self = fromUserdata(userdata);
-    const task = try self.spawnTaskFiber(.group, 0, .@"1", context, context_alignment);
-    task.start_fn = .{ .group = start };
+    const task = try self.spawnTaskFiber(true, 0, .@"1", context, context_alignment);
+    task.role.group.start = start;
     linkGroupTask(group, task);
     self.active_tasks += 1;
     self.enqueueReady(task);
@@ -945,7 +934,7 @@ fn vtableGroupConcurrent(
 fn vtableGroupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
     _ = token;
     const self = fromUserdata(userdata);
-    if (group.token.load(.acquire) == null) return;
+    if (group.token.load(.acquire) == null) return self.checkCancelPoint();
 
     const GroupAwaitState = struct {
         group: *Io.Group,
@@ -1007,18 +996,12 @@ fn vtableGroupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque)
 
 // ── VTable: Clock & `sleep` ─────────────────────────────────────────────────
 
+const vtableNow = forwardThreaded("now", .inline_uncancelable);
+const vtableClockResolution = forwardThreaded("clockResolution", .inline_uncancelable);
+
 pub fn awakeNowNs(self: *Shard) i96 {
-    return self.driver.now(.awake).nanoseconds;
-}
-
-fn vtableNow(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
-    const self = fromUserdata(userdata);
-    return self.driver.now(clock);
-}
-
-fn vtableClockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
-    const self = fromUserdata(userdata);
-    return self.driver.clockResolution(clock);
+    const t_io = self.blocking_pool.threaded.io();
+    return t_io.vtable.now(t_io.userdata, .awake).nanoseconds;
 }
 
 inline fn resolveDeadlineNs(self: *Shard, timeout: Io.Timeout) ?i96 {
@@ -1100,9 +1083,9 @@ const FutexParkState = struct {
     done: bool = false,
     canceled: bool = false,
 
-    fn onCrossThreadWake(owner_ctx: ?*anyopaque, w: *FutexTable.Waiter) void {
-        const target: *Shard = @ptrCast(@alignCast(owner_ctx.?));
+    fn onCrossThreadWake(w: *FutexTable.Waiter) void {
         const st: *FutexParkState = @fieldParentPtr("waiter", w);
+        const target = st.shard;
         if (tls_current_shard == target) {
             deliverFutexWaiterOnOwner(target, w);
             return;
@@ -1188,7 +1171,6 @@ fn futexWaitInternal(
         .waiter = .{
             .ptr = ptr,
             .expected = expected,
-            .owner_ctx = self,
             .wake_fn = FutexParkState.onCrossThreadWake,
         },
         .resume_node = .{ .callback = FutexParkState.onResumeNode },
@@ -1199,9 +1181,12 @@ fn futexWaitInternal(
     }
 
     if (maybe_dl) |dl| {
-        if (self.timers.schedule(self.gpa, dl, &st, FutexParkState.onTimer)) |tok| {
-            st.timer_token = tok;
-        } else |_| {}
+        st.timer_token = self.timers.schedule(self.gpa, dl, &st, FutexParkState.onTimer) catch {
+            if (!self.futex_table.unpark(&st.waiter)) {
+                while (!st.done) self.suspendCurrent();
+            }
+            return;
+        };
     }
 
     if (cancelable) {
@@ -1296,29 +1281,16 @@ pub fn callBlocking(
         .args = args,
     };
 
-    while (true) {
-        ctx.job = .{
-            .run_fn = Ctx.exec,
-            .resume_lane = &self.resume_lane,
-            .resume_node = .{ .callback = Ctx.onResume },
-            .notify_ctx = self,
-            .notify_fn = notifyOpaque,
-        };
-        switch (self.blocking_pool.submitWaitable(&ctx.job)) {
-            .accepted => break,
-            .queue_full => {
-                if (can_cancel) {
-                    try vtableSleep(self, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } });
-                } else {
-                    const prev = vtableSwapCancelProtection(self, .blocked);
-                    defer _ = vtableSwapCancelProtection(self, prev);
-                    vtableSleep(self, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch unreachable;
-                }
-            },
-            .closed => {
-                return @call(.auto, func, .{&self.blocking_pool.threaded} ++ args);
-            },
-        }
+    ctx.job = .{
+        .run_fn = Ctx.exec,
+        .resume_lane = &self.resume_lane,
+        .resume_node = .{ .callback = Ctx.onResume },
+        .notify_ctx = self,
+        .notify_fn = notifyOpaque,
+    };
+    switch (self.blocking_pool.submitWaitable(&ctx.job)) {
+        .accepted => {},
+        .queue_full, .closed => unreachable,
     }
 
     if (can_cancel) {
@@ -1333,14 +1305,6 @@ pub fn callBlocking(
     if (can_cancel and ctx.canceled_queued) {
         if (cur.shouldCancelNow()) cur.acknowledgeCancel();
         return error.Canceled;
-    }
-    if (can_cancel and cur.shouldCancelNow()) {
-        if (@typeInfo(Ret) == .error_union and @typeInfo(Ret).error_union.payload == void) {
-            if (ctx.result) |_| {
-                cur.acknowledgeCancel();
-                return error.Canceled;
-            } else |_| {}
-        }
     }
     return ctx.result;
 }
@@ -1364,35 +1328,18 @@ fn vtableBatchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!
     if (batch.pending.head != .none) {
         return self.waitBatchCompletion(batch, .none) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            error.Timeout => unreachable,
+            error.Timeout, error.ConcurrencyUnavailable => unreachable,
         };
     }
 
     if (batch.submitted.head != .none) {
         const idx = batch.submitted.head.toIndex();
-        const op = batch.storage[idx].submission.operation;
-        const next_oi = batch.storage[idx].submission.node.next;
-        batch.submitted.head = next_oi;
-        if (next_oi == .none) batch.submitted.tail = .none;
-
-        const oi = Io.Operation.OptionalIndex.fromIndex(idx);
-        errdefer {
-            const tail = batch.unused.tail;
-            switch (tail) {
-                .none => batch.unused.head = oi,
-                else => |tail_oi| batch.storage[tail_oi.toIndex()].unused.next = oi,
-            }
-            batch.storage[idx] = .{ .unused = .{ .prev = tail, .next = .none } };
-            batch.unused.tail = oi;
-        }
-
-        const res = try self.driver.operate(self, op);
-        switch (batch.completed.tail) {
-            .none => batch.completed.head = oi,
-            else => |tail_oi| batch.storage[tail_oi.toIndex()].completion.node.next = oi,
-        }
-        batch.storage[idx] = .{ .completion = .{ .node = .{ .next = .none }, .result = res } };
-        batch.completed.tail = oi;
+        const submission = batch.storage[idx].submission;
+        // Stays on `submitted` until performed, so a canceled attempt is retried by the next await.
+        const res = try self.driver.operate(self, submission.operation);
+        batch.submitted.head = submission.node.next;
+        if (submission.node.next == .none) batch.submitted.tail = .none;
+        PlatformIo.batchAppendCompleted(batch, idx, res);
     }
 }
 
@@ -1409,10 +1356,15 @@ fn vtableBatchAwaitConcurrent(
     return self.waitBatchCompletion(batch, timeout);
 }
 
-fn waitBatchCompletion(self: *Shard, batch: *Io.Batch, timeout: Io.Timeout) (Io.Cancelable || Io.Timeout.Error)!void {
+fn waitBatchCompletion(self: *Shard, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
     const maybe_dl = self.resolveDeadlineNs(timeout);
     if (maybe_dl) |dl| {
-        if (dl <= self.awakeNowNs()) return error.Timeout;
+        if (dl <= self.awakeNowNs()) {
+            self.drainIncoming();
+            _ = self.driver.poll(0);
+            if (batch.completed.head != .none or batch.pending.head == .none) return;
+            return self.abandonBatchWait(batch, error.Timeout);
+        }
     }
 
     const WaitState = struct {
@@ -1445,47 +1397,71 @@ fn waitBatchCompletion(self: *Shard, batch: *Io.Batch, timeout: Io.Timeout) (Io.
     const cur = self.current_task;
     var st: WaitState = .{ .shard = self, .task = cur };
     if (maybe_dl) |dl| {
-        if (self.timers.schedule(self.gpa, dl, &st, WaitState.onTimer)) |tok| {
-            st.timer_token = tok;
-        } else |_| {}
+        st.timer_token = self.timers.schedule(self.gpa, dl, &st, WaitState.onTimer) catch
+            return error.ConcurrencyUnavailable;
     }
 
     batch.userdata = cur;
     cur.cancel_hook = .{ .ctx = &st, .trigger = WaitState.onCancel };
-    defer {
-        batch.userdata = null;
-        cur.cancel_hook = null;
-        if (st.timer_token.isActive()) _ = self.timers.cancel(st.timer_token);
-    }
-
     while (batch.completed.head == .none and batch.pending.head != .none and !st.timed_out and !st.canceled) {
         self.suspendCurrent();
     }
+    batch.userdata = null;
+    cur.cancel_hook = null;
+    if (st.timer_token.isActive()) _ = self.timers.cancel(st.timer_token);
 
-    if (st.canceled) {
-        if (cur.shouldCancelNow()) cur.acknowledgeCancel();
-        return error.Canceled;
-    }
-    if (batch.completed.head == .none and batch.pending.head != .none and st.timed_out) {
-        return error.Timeout;
+    // A completion outranks a simultaneous timeout or cancel request (the latter stays armed).
+    if (batch.completed.head != .none or batch.pending.head == .none) return;
+    return self.abandonBatchWait(batch, if (st.canceled) error.Canceled else error.Timeout);
+}
+
+/// Leaves no driver state referencing `batch` before an await reports `err`, because
+/// `std.Io.operateTimeout` drops its stack `Batch` on `error.Timeout` / `error.Canceled`
+/// without calling `Batch.cancel`. Unstarted operations return to `submitted` (resubmitted by
+/// the next await); an operation that completes while being reaped outranks `err`.
+fn abandonBatchWait(
+    self: *Shard,
+    batch: *Io.Batch,
+    err: Io.Batch.AwaitConcurrentError,
+) Io.Batch.AwaitConcurrentError!void {
+    self.driver.withdrawBatchPending(batch);
+    self.reapBatchPending(batch);
+    if (batch.completed.head != .none) return;
+
+    const cur = self.current_task;
+    if (err == error.Canceled and cur.shouldCancelNow()) cur.acknowledgeCancel();
+    return err;
+}
+
+/// Uncancelably waits out operations `withdrawBatchPending` could not detach synchronously:
+/// in-flight IOCP `OVERLAPPED`s and jobs a `BlockingPool` worker is already running.
+fn reapBatchPending(self: *Shard, batch: *Io.Batch) void {
+    if (batch.pending.head == .none) return;
+    batch.userdata = self.current_task;
+    defer batch.userdata = null;
+    while (batch.pending.head != .none) {
+        self.suspendCurrent();
     }
 }
 
 fn vtableBatchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const self = fromUserdata(userdata);
-    self.driver.cancelBatchPending(batch);
+    self.driver.withdrawBatchPending(batch);
+    self.reapBatchPending(batch);
 
-    // Uncancelably drain all remaining in-flight `IOCP` OVERLAPPEDs & running BlockingPool jobs!
-    if (batch.pending.head != .none) {
-        batch.userdata = self.current_task;
-        defer batch.userdata = null;
-        while (batch.pending.head != .none) {
-            self.suspendCurrent();
-        }
+    // Withdrawn operations never ran: their slots return to `unused`, absent from `Batch.next`.
+    var oi = batch.submitted.head;
+    while (oi != .none) {
+        const idx = oi.toIndex();
+        oi = batch.storage[idx].submission.node.next;
+        PlatformIo.batchReturnUnused(batch, idx);
     }
+    batch.submitted = .empty;
 }
 
 // ── VTable: Random & Stderr ─────────────────────────────────────────────────
+
+const vtableRandomSecure = forwardThreaded("randomSecure", .inline_fast);
 
 fn vtableRandom(userdata: ?*anyopaque, buffer: []u8) void {
     const self = fromUserdata(userdata);
@@ -1504,26 +1480,8 @@ fn vtableRandom(userdata: ?*anyopaque, buffer: []u8) void {
     self.csprng.rng.fill(buffer);
 }
 
-fn vtableRandomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
-    const self = fromUserdata(userdata);
-    try self.checkCancelPoint();
-    if (buffer.len == 0) return;
-
-    // Small buffers (e.g. CSPRNG seed) can safely query OS entropy directly via `Threaded.io()`.
-    if (buffer.len <= 256) {
-        const t_io = self.blocking_pool.threaded.io();
-        return t_io.vtable.randomSecure(t_io.userdata, buffer);
-    }
-    return self.callBlocking(true, struct {
-        fn run(t: *Threaded, buf: []u8) Io.RandomSecureError!void {
-            const t_io = t.io();
-            return t_io.vtable.randomSecure(t_io.userdata, buf);
-        }
-    }.run, .{buffer});
-}
-
 fn ensureStderrInitialized(self: *Shard) void {
-    const io_inst = self.ioUnchecked();
+    const io_inst = self.io();
     if (!self.stderr_initialized) {
         const prev = vtableSwapCancelProtection(self, .blocked);
         defer _ = vtableSwapCancelProtection(self, prev);
@@ -1560,20 +1518,25 @@ fn ensureStderrInitialized(self: *Shard) void {
     }
 }
 
-fn vtableLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
-    const self = fromUserdata(userdata);
-    const cur = self.current_task;
-    if (self.stderr_locker != cur) {
-        try self.stderr_mutex.lock(self.ioUnchecked());
-        assert(self.stderr_lock_count == 0);
-        self.stderr_locker = cur;
-    }
+fn finishLockStderr(self: *Shard, cur: *Task, terminal_mode: ?Io.Terminal.Mode) Io.LockedStderr {
+    self.stderr_locker = cur;
     self.stderr_lock_count += 1;
     self.ensureStderrInitialized();
     return .{
         .file_writer = &self.stderr_writer,
         .terminal_mode = terminal_mode orelse self.stderr_mode,
     };
+}
+
+fn vtableLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    const self = fromUserdata(userdata);
+    try self.checkCancelPoint();
+    const cur = self.current_task;
+    if (self.stderr_locker != cur) {
+        try self.stderr_mutex.lock(self.io());
+        assert(self.stderr_lock_count == 0);
+    }
+    return self.finishLockStderr(cur, terminal_mode);
 }
 
 fn vtableTryLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
@@ -1583,14 +1546,8 @@ fn vtableTryLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) 
     if (self.stderr_locker != cur) {
         if (!self.stderr_mutex.tryLock()) return null;
         assert(self.stderr_lock_count == 0);
-        self.stderr_locker = cur;
     }
-    self.stderr_lock_count += 1;
-    self.ensureStderrInitialized();
-    return .{
-        .file_writer = &self.stderr_writer,
-        .terminal_mode = terminal_mode orelse self.stderr_mode,
-    };
+    return self.finishLockStderr(cur, terminal_mode);
 }
 
 fn vtableUnlockStderr(userdata: ?*anyopaque) void {
@@ -1618,7 +1575,7 @@ fn vtableUnlockStderr(userdata: ?*anyopaque) void {
     self.stderr_lock_count -= 1;
     if (self.stderr_lock_count == 0) {
         self.stderr_locker = null;
-        self.stderr_mutex.unlock(self.ioUnchecked());
+        self.stderr_mutex.unlock(self.io());
     }
 }
 
@@ -1723,6 +1680,17 @@ fn vtableFileWriteFileStreaming(
     return self.driver.fileWriteFileStreaming(self, file, header, file_reader, limit);
 }
 
+pub fn writePositional(
+    self: *Shard,
+    file: File,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    offset: u64,
+) File.WritePositionalError!usize {
+    return forwardThreaded("fileWritePositional", .pool)(self, file, header, data, splat, offset);
+}
+
 fn vtableFileWriteFilePositional(
     userdata: ?*anyopaque,
     file: File,
@@ -1741,7 +1709,31 @@ fn vtableProcessSpawn(
     options: std.process.SpawnOptions,
 ) std.process.SpawnError!std.process.Child {
     const self = fromUserdata(userdata);
-    return self.driver.processSpawn(self, options);
+    var sanitized = options;
+    sanitized.progress_node = .none;
+    var child = try forwardThreaded("processSpawn", .pool)(userdata, sanitized);
+    self.driver.afterProcessSpawn(&child);
+    return child;
+}
+
+fn detachChildPipes(child: *std.process.Child) [3]?File {
+    const pipes: [3]?File = .{ child.stdin, child.stdout, child.stderr };
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+    return pipes;
+}
+
+fn restoreChildPipes(child: *std.process.Child, pipes: [3]?File) void {
+    child.stdin = pipes[0];
+    child.stdout = pipes[1];
+    child.stderr = pipes[2];
+}
+
+fn closeChildPipes(self: *Shard, pipes: [3]?File) void {
+    for (pipes) |maybe_f| {
+        if (maybe_f) |f| self.driver.fileClose((&f)[0..1]);
+    }
 }
 
 fn vtableChildWait(
@@ -1749,12 +1741,42 @@ fn vtableChildWait(
     child: *std.process.Child,
 ) std.process.Child.WaitError!std.process.Child.Term {
     const self = fromUserdata(userdata);
-    return self.driver.childWait(self, child);
+    try self.checkCancelPoint();
+    if (try self.driver.waitChildFast(self, child)) {
+        const pipes = detachChildPipes(child);
+        defer self.closeChildPipes(pipes);
+        return forwardThreaded("childWait", .inline_uncancelable)(userdata, child);
+    }
+    const pipes = detachChildPipes(child);
+    errdefer if (child.id != null) restoreChildPipes(child, pipes) else self.closeChildPipes(pipes);
+    const term = try forwardThreaded("childWait", .pool)(userdata, child);
+    self.closeChildPipes(pipes);
+    return term;
 }
 
 fn vtableChildKill(userdata: ?*anyopaque, child: *std.process.Child) void {
     const self = fromUserdata(userdata);
-    self.driver.childKill(self, child);
+    const pipes = detachChildPipes(child);
+    defer self.closeChildPipes(pipes);
+    forwardThreaded("childKill", .pool_uncancelable)(userdata, child);
+}
+
+fn vtableProgressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!File {
+    const self = fromUserdata(userdata);
+    var file = try forwardThreaded("progressParentFile", .inline_fast)(userdata);
+    self.driver.adoptNonblockingFile(&file);
+    return file;
+}
+
+fn vtableInheritParentFile(
+    userdata: ?*anyopaque,
+    handle: File.Handle,
+    flags: File.Flags,
+) Io.InheritParentHandleError!File {
+    const self = fromUserdata(userdata);
+    var file = try forwardThreaded("inheritParentFile", .inline_fast)(userdata, handle, flags);
+    self.driver.adoptNonblockingFile(&file);
+    return file;
 }
 
 // ── VTable: Networking (`net*`) ─────────────────────────────────────────────
@@ -1766,7 +1788,7 @@ fn vtableNetListenIp(
 ) net.IpAddress.ListenError!net.Socket {
     const self = fromUserdata(userdata);
     try self.checkCancelPoint();
-    return self.driver.netListenIp(self, address, options);
+    return self.driver.netListenIp(address, options);
 }
 
 fn vtableNetAccept(
@@ -1859,22 +1881,15 @@ fn vtableNetShutdown(
     return self.driver.netShutdown(handle, how);
 }
 
-fn vtableNetInterfaceNameResolve(
-    userdata: ?*anyopaque,
-    name: *const net.Interface.Name,
-) net.Interface.Name.ResolveError!net.Interface {
-    const self = fromUserdata(userdata);
-    try self.checkCancelPoint();
-    return self.driver.netInterfaceNameResolve(self, name);
-}
-
-fn vtableNetInterfaceName(
-    userdata: ?*anyopaque,
-    interface: net.Interface,
-) net.Interface.NameError!net.Interface.Name {
-    const self = fromUserdata(userdata);
-    try self.checkCancelPoint();
-    return self.driver.netInterfaceName(self, interface);
+fn pushResolved(
+    shard_io: Io,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    items: []const net.HostName.LookupResult,
+) Io.Cancelable!void {
+    resolved.putAll(shard_io, items) catch |err| switch (err) {
+        error.Closed => {},
+        error.Canceled => return error.Canceled,
+    };
 }
 
 fn vtableNetLookup(
@@ -1884,12 +1899,14 @@ fn vtableNetLookup(
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
     const self = fromUserdata(userdata);
-    const shard_io = self.ioUnchecked();
+    const shard_io = self.io();
     defer resolved.close(shard_io);
 
     try self.checkCancelPoint();
 
     const name = host_name.bytes;
+    if (name.len == 0) return error.UnknownHostName;
+
     const parsed_literal: ?net.IpAddress = if (net.IpAddress.parseIp6(name, options.port)) |addr| blk: {
         if (options.family == .ip4) return error.UnknownHostName;
         break :blk addr;
@@ -1901,18 +1918,12 @@ fn vtableNetLookup(
     if (parsed_literal) |addr| {
         if (options.canonical_name_buffer) |cbuf| {
             @memcpy(cbuf[0..name.len], name);
-            resolved.putAll(shard_io, &.{
+            try pushResolved(shard_io, resolved, &.{
                 .{ .address = addr },
                 .{ .canonical_name = .{ .bytes = cbuf[0..name.len] } },
-            }) catch |err| switch (err) {
-                error.Closed => unreachable,
-                error.Canceled => return error.Canceled,
-            };
+            });
         } else {
-            resolved.putOne(shard_io, .{ .address = addr }) catch |err| switch (err) {
-                error.Closed => unreachable,
-                error.Canceled => return error.Canceled,
-            };
+            try pushResolved(shard_io, resolved, &.{.{ .address = addr }});
         }
         return;
     }
@@ -1937,10 +1948,7 @@ fn vtableNetLookup(
             items[count_items] = .{ .canonical_name = .{ .bytes = cbuf[0..canon.len] } };
             count_items += 1;
         }
-        resolved.putAll(shard_io, items[0..count_items]) catch |err| switch (err) {
-            error.Closed => unreachable,
-            error.Canceled => return error.Canceled,
-        };
+        try pushResolved(shard_io, resolved, items[0..count_items]);
         return;
     }
 
@@ -1973,10 +1981,7 @@ fn vtableNetLookup(
     }.run, .{ host_name, options, &batch_out });
 
     if (batch_out.len > 0) {
-        resolved.putAll(shard_io, batch_out.items[0..batch_out.len]) catch |err| switch (err) {
-            error.Closed => unreachable,
-            error.Canceled => return error.Canceled,
-        };
+        try pushResolved(shard_io, resolved, batch_out.items[0..batch_out.len]);
     }
 }
 
@@ -2076,9 +2081,9 @@ const vtable: Io.VTable = .{
     .childWait = vtableChildWait,
     .childKill = vtableChildKill,
 
-    .progressParentFile = forwardThreaded("progressParentFile", .inline_fast),
+    .progressParentFile = vtableProgressParentFile,
     .inheritParentDir = forwardThreaded("inheritParentDir", .inline_fast),
-    .inheritParentFile = forwardThreaded("inheritParentFile", .inline_fast),
+    .inheritParentFile = vtableInheritParentFile,
 
     .now = vtableNow,
     .clockResolution = vtableClockResolution,
@@ -2097,7 +2102,7 @@ const vtable: Io.VTable = .{
     .netWriteFile = vtableNetWriteFile,
     .netClose = vtableNetClose,
     .netShutdown = vtableNetShutdown,
-    .netInterfaceNameResolve = vtableNetInterfaceNameResolve,
-    .netInterfaceName = vtableNetInterfaceName,
+    .netInterfaceNameResolve = forwardThreaded("netInterfaceNameResolve", .pool),
+    .netInterfaceName = forwardThreaded("netInterfaceName", .pool),
     .netLookup = vtableNetLookup,
 };

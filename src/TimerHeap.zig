@@ -1,13 +1,10 @@
 //! Shard-local monotonic 4-ary timer min-heap backed by an index-tracked,
 //! generation-stamped slot pool.
 //!
-//! Design invariants (AGENTS.md §4, §5):
-//! - 4-ary min-heap (`d = 4`, adapted from Go's runtime timer heap): 4 sibling
-//!   entries sit contiguously per level, halving tree height and cache misses.
+//! - 4-ary min-heap (`d = 4`): 4 sibling entries sit contiguously per level,
+//!   halving tree height and cache misses.
 //! - Generation-stamped `Slot`s prevent ABA mis-cancellation across slot reuse,
-//!   while `Slot.heap_index` (stored in an existing 4-byte struct padding hole
-//!   at zero extra memory cost) enables exact O(log_4 N) in-place removal on
-//!   `cancel()` — zero stale heap bloat and zero O(N) compaction scans.
+//!   while `Slot.heap_index` enables exact O(log_4 N) in-place removal on `cancel()`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -81,7 +78,6 @@ const Slot = struct {
     generation: u64 = 0,
     next_free: u32 = no_slot,
     heap_index: u32 = no_slot,
-    occupied: bool = false,
     ctx: ?*anyopaque = null,
     callback: Callback = undefined,
 };
@@ -100,7 +96,6 @@ const Entry = struct {
 slots: std.ArrayListUnmanaged(Slot) = .empty,
 heap: std.ArrayListUnmanaged(Entry) = .empty,
 free_head: u32 = no_slot,
-active_count: usize = 0,
 min_generation: u64 = 1,
 next_sequence: u64 = 1,
 dispatching: bool = false,
@@ -109,7 +104,6 @@ dispatch_round_ns: i96 = std.math.minInt(i96),
 pub const init: TimerHeap = .{};
 
 pub fn deinit(self: *TimerHeap, gpa: Allocator) void {
-    assert(self.active_count == 0);
     assert(self.heap.items.len == 0);
     self.heap.deinit(gpa);
     self.slots.deinit(gpa);
@@ -120,12 +114,11 @@ pub inline fn hasActive(self: *const TimerHeap) bool {
     return self.heap.items.len != 0;
 }
 
-/// Reclaims excess backing storage back to `gpa` when idle (`active_count == 0`)
+/// Reclaims excess backing storage back to `gpa` when idle (`heap.items.len == 0`)
 /// and capacity exceeds `max_cached_capacity`, advancing `min_generation` past
 /// all previously issued slot generations so stale tokens remain ABA-safe.
 pub fn scavengeIdle(self: *TimerHeap, gpa: Allocator) void {
-    if (self.active_count != 0) return;
-    assert(self.heap.items.len == 0);
+    if (self.heap.items.len != 0) return;
     if (self.heap.capacity > max_cached_capacity) {
         self.heap.clearAndFree(gpa);
     }
@@ -168,7 +161,6 @@ pub fn schedule(
     if (slot.generation < self.min_generation) slot.generation = self.min_generation;
     slot.next_free = no_slot;
     slot.heap_index = @intCast(heap_idx);
-    slot.occupied = true;
     slot.ctx = ctx;
     slot.callback = callback;
 
@@ -188,7 +180,6 @@ pub fn schedule(
         .slot = slot_index,
     });
     self.siftUp(heap_idx);
-    self.active_count += 1;
 
     return .{
         .slot = slot_index,
@@ -201,7 +192,7 @@ pub fn schedule(
 pub fn cancel(self: *TimerHeap, token: Token) bool {
     if (!token.isActive() or token.slot >= self.slots.items.len) return false;
     const slot = &self.slots.items[token.slot];
-    if (!slot.occupied or slot.generation != token.generation) return false;
+    if (slot.heap_index == no_slot or slot.generation != token.generation) return false;
 
     const h_idx = slot.heap_index;
     assert(h_idx < self.heap.items.len);
@@ -238,7 +229,6 @@ pub fn fireExpired(self: *TimerHeap, now_ns: i96) usize {
 
         _ = self.removeHeapAt(0);
         const slot = &self.slots.items[top.slot];
-        assert(slot.occupied);
         const cb = slot.callback;
         const ctx = slot.ctx;
         self.releaseSlot(top.slot);
@@ -256,24 +246,19 @@ pub fn cancelAll(self: *TimerHeap) void {
     while (self.heap.items.len != 0) {
         const top = self.removeHeapAt(0);
         const slot = &self.slots.items[top.slot];
-        assert(slot.occupied);
         const cb = slot.callback;
         const ctx = slot.ctx;
         self.releaseSlot(top.slot);
         cb(ctx, .canceled);
     }
-    assert(self.active_count == 0);
 }
 
 fn releaseSlot(self: *TimerHeap, slot_index: u32) void {
     const slot = &self.slots.items[slot_index];
-    assert(slot.occupied);
-    slot.occupied = false;
-    slot.heap_index = no_slot;
+    assert(slot.heap_index == no_slot);
     slot.ctx = null;
     slot.next_free = self.free_head;
     self.free_head = slot_index;
-    self.active_count -= 1;
 }
 
 inline fn placeAt(self: *TimerHeap, idx: usize, entry: Entry) void {

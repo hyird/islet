@@ -1,18 +1,15 @@
 //! Dedicated Windows `SO_EXCLUSIVEADDRUSE` Acceptor transparently backing
 //! multi-Shard `netListenIp(..., .{ .reuse_address = true })` and `netAccept`.
 //!
-//! Why this exists (AGENTS.md §2):
-//! - Windows lacks `SO_REUSEPORT` TCP load-balancing (`SO_REUSEADDR` permits port
-//!   stealing rather than kernel distribution) and forbids rebinding a `SOCKET`
+//! - Windows lacks `SO_REUSEPORT` TCP load-balancing and forbids rebinding a `SOCKET`
 //!   once associated with an IOCP.
 //! - The Acceptor owns one exclusive listener `SOCKET` per shared endpoint on its
-//!   own IOCP, keeps `accepts_per_listener` `AcceptEx` calls in flight using raw
-//!   unassociated `SOCKET`s, reserves a slot in the least-loaded subscribed Shard's
-//!   bounded `Mailbox` before handoff (closing refused sockets when full), and lets
-//!   the target Shard associate the `SOCKET` with its own IOCP
-//!   for the first and only time in `netAccept`.
-//! - On Linux (where kernel `SO_REUSEPORT` distributes directly to each Shard's
-//!   `epoll`), `Acceptor` compiles to a zero-sized no-op struct.
+//!   own IOCP, submits all `AcceptEx` calls from its dedicated thread using raw
+//!   unassociated `SOCKET`s, admits connections into the least-loaded subscribed
+//!   Shard's bounded `Mailbox` (closing refused sockets when full), and lets the
+//!   target Shard associate the `SOCKET` with its own IOCP for the first and only
+//!   time in `netAccept`.
+//! - On Linux, `Acceptor` compiles to a zero-sized no-op struct.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -35,15 +32,8 @@ const NoopAcceptor = struct {
     pub fn shardPtr(_: *NoopAcceptor) ?*NoopAcceptor {
         return null;
     }
-    pub fn bindShard(_: *NoopAcceptor, _: usize, _: ?*anyopaque, _: *const fn (?*anyopaque) void) void {}
     pub fn requestStop(_: *NoopAcceptor) void {}
     pub fn join(_: *NoopAcceptor) void {}
-    pub fn inboxCapacity(_: *const NoopAcceptor) u32 {
-        return 0;
-    }
-    pub fn isSharedToken(_: *const NoopAcceptor, _: net.Socket.Handle) ?u32 {
-        return null;
-    }
 };
 
 const WindowsAcceptor = struct {
@@ -58,14 +48,14 @@ const WindowsAcceptor = struct {
     const accepts_per_listener = 8;
     const addr_slot_bytes: win32.DWORD = @sizeOf(ws2_32.sockaddr.storage) + 16;
 
-    pub const ShardTarget = struct {
+    const ShardTarget = struct {
         inbox: Mailbox(AcceptedSocket),
         active_load: std.atomic.Value(usize) = .init(0),
         notify_ctx: ?*anyopaque = null,
         notify_fn: ?*const fn (?*anyopaque) void = null,
     };
 
-    pub const Token = struct {
+    const Token = struct {
         in_use: bool = false,
         shard_id: u32 = 0,
         listener_id: u32 = 0,
@@ -82,7 +72,7 @@ const WindowsAcceptor = struct {
     const SharedListener = struct {
         active: bool = false,
         closing: bool = false,
-        requested_addr: net.IpAddress = .{ .ip4 = .loopback(0) },
+        needs_arm: bool = false,
         bound_addr: net.IpAddress = .{ .ip4 = .loopback(0) },
         family: c_int = 0,
         sock_type: c_int = 0,
@@ -98,7 +88,6 @@ const WindowsAcceptor = struct {
 
     enabled: bool = false,
     gpa: Allocator,
-    shard_count: usize,
     inbox_capacity: u32,
     shards: []ShardTarget,
     tokens: []Token,
@@ -106,6 +95,7 @@ const WindowsAcceptor = struct {
     iocp: Iocp,
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
+    has_pending_arm: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
     joined: bool = false,
 
@@ -124,7 +114,6 @@ const WindowsAcceptor = struct {
             self.* = .{
                 .enabled = false,
                 .gpa = gpa,
-                .shard_count = 1,
                 .inbox_capacity = 0,
                 .shards = &.{},
                 .tokens = &.{},
@@ -162,7 +151,6 @@ const WindowsAcceptor = struct {
         self.* = .{
             .enabled = true,
             .gpa = gpa,
-            .shard_count = shard_count,
             .inbox_capacity = cap,
             .shards = shards,
             .tokens = tokens,
@@ -222,23 +210,34 @@ const WindowsAcceptor = struct {
         options: net.IpAddress.ListenOptions,
     ) net.IpAddress.ListenError!net.Socket {
         const kio = kernelIo();
+        var wake_acceptor = false;
+        defer if (wake_acceptor) self.iocp.notifyFromAnyThread();
+
         self.mutex.lockUncancelable(kio);
         defer self.mutex.unlock(kio);
 
         if (self.stopping.load(.acquire)) return error.NetworkDown;
 
+        const token_idx: u32 = for (self.tokens, 0..) |*t, idx| {
+            if (!t.in_use) break @intCast(idx);
+        } else return error.SystemResources;
+
         const af = Threaded.posixAddressFamily(address);
         const mode_proto = try Threaded.posixSocketModeProtocol(af, options.mode, options.protocol);
 
-        // Match existing shared listener if already bound for this endpoint.
+        // Match existing shared listener iff a concrete non-zero port was requested
+        // (ephemeral port 0 always allocates a distinct bound port, while sibling
+        // Shards joining `bound_addr` match `l.bound_addr` cleanly).
         var found_id: ?u32 = null;
-        for (self.listeners, 0..) |*l, idx| {
-            if (l.active and !l.closing and std.meta.eql(l.requested_addr, address.*) and
-                l.sock_type == @as(c_int, @intCast(mode_proto[0])) and
-                l.protocol == @as(c_int, @intCast(mode_proto[1])))
-            {
-                found_id = @intCast(idx);
-                break;
+        if (address.getPort() != 0) {
+            for (self.listeners, 0..) |*l, idx| {
+                if (l.active and !l.closing and std.meta.eql(l.bound_addr, address.*) and
+                    l.sock_type == @as(c_int, @intCast(mode_proto[0])) and
+                    l.protocol == @as(c_int, @intCast(mode_proto[1])))
+                {
+                    found_id = @intCast(idx);
+                    break;
+                }
             }
         }
 
@@ -293,7 +292,7 @@ const WindowsAcceptor = struct {
             l.* = .{
                 .active = true,
                 .closing = false,
-                .requested_addr = address.*,
+                .needs_arm = true,
                 .bound_addr = bound_addr,
                 .family = af,
                 .sock_type = @intCast(mode_proto[0]),
@@ -301,6 +300,13 @@ const WindowsAcceptor = struct {
                 .listen_sock = sock,
                 .accept_ex = accept_ex,
             };
+            for (&l.slots) |*slot| {
+                slot.* = .{
+                    .comp = .{ .callback = onAcceptComplete },
+                    .owner = self,
+                    .listener_id = free_id,
+                };
+            }
 
             if (self.thread == null) {
                 self.thread = std.Thread.spawn(.{ .allocator = self.gpa }, acceptorLoop, .{self}) catch {
@@ -308,21 +314,10 @@ const WindowsAcceptor = struct {
                     return error.SystemResources;
                 };
             }
-
-            for (&l.slots) |*slot| {
-                slot.* = .{
-                    .comp = .{ .callback = onAcceptComplete },
-                    .owner = self,
-                    .listener_id = free_id,
-                };
-                self.startAcceptLocked(l, slot);
-            }
+            self.has_pending_arm.store(true, .seq_cst);
+            wake_acceptor = true;
             break :blk free_id;
         };
-
-        const token_idx: u32 = for (self.tokens, 0..) |*t, idx| {
-            if (!t.in_use) break @intCast(idx);
-        } else return error.SystemResources;
 
         const l = &self.listeners[listener_id];
         const bit = @as(u64, 1) << @intCast(shard_id);
@@ -343,24 +338,26 @@ const WindowsAcceptor = struct {
         };
     }
 
-    pub fn closeToken(self: *WindowsAcceptor, token_idx: u32) void {
+    /// Closes `token_idx` and returns `listener_id` iff the owning Shard holds no
+    /// remaining tokens on that shared listener (so the Shard can flush queued sockets).
+    pub fn closeToken(self: *WindowsAcceptor, token_idx: u32) ?u32 {
         const kio = kernelIo();
         self.mutex.lockUncancelable(kio);
         defer self.mutex.unlock(kio);
 
         const tok = &self.tokens[token_idx];
-        if (!tok.in_use) return;
+        if (!tok.in_use) return null;
         const shard_id = tok.shard_id;
         const listener_id = tok.listener_id;
         tok.* = .{};
 
         const l = &self.listeners[listener_id];
-        if (!l.active) return;
+        if (!l.active) return listener_id;
 
         // Check whether this shard still holds another token on the same listener.
         for (self.tokens) |other| {
             if (other.in_use and other.listener_id == listener_id and other.shard_id == shard_id) {
-                return;
+                return null;
             }
         }
 
@@ -370,6 +367,7 @@ const WindowsAcceptor = struct {
             l.ref_count -= 1;
             if (l.ref_count == 0 and !l.closing) {
                 l.closing = true;
+                l.needs_arm = false;
                 if (l.listen_sock != win32.INVALID_SOCKET) {
                     _ = win32.closesocket(l.listen_sock);
                     l.listen_sock = win32.INVALID_SOCKET;
@@ -379,6 +377,7 @@ const WindowsAcceptor = struct {
                 }
             }
         }
+        return listener_id;
     }
 
     pub fn drainShardInbox(
@@ -411,6 +410,7 @@ const WindowsAcceptor = struct {
         for (self.listeners) |*l| {
             if (l.active and !l.closing) {
                 l.closing = true;
+                l.needs_arm = false;
                 if (l.listen_sock != win32.INVALID_SOCKET) {
                     _ = win32.closesocket(l.listen_sock);
                     l.listen_sock = win32.INVALID_SOCKET;
@@ -421,7 +421,6 @@ const WindowsAcceptor = struct {
             }
         }
         self.mutex.unlock(kio);
-        self.iocp.doorbell.armBeforeSleep();
         self.iocp.notifyFromAnyThread();
     }
 
@@ -442,20 +441,37 @@ const WindowsAcceptor = struct {
         if (maybe_thread) |t| t.join();
     }
 
+    fn armPendingListeners(self: *WindowsAcceptor, kio: std.Io) void {
+        self.mutex.lockUncancelable(kio);
+        defer self.mutex.unlock(kio);
+        if (self.stopping.load(.acquire)) return;
+        for (self.listeners) |*l| {
+            if (l.active and !l.closing and l.needs_arm) {
+                l.needs_arm = false;
+                for (&l.slots) |*slot| {
+                    self.startAcceptLocked(l, slot);
+                }
+            }
+        }
+    }
+
     fn acceptorLoop(self: *WindowsAcceptor) void {
         const kio = kernelIo();
         while (true) {
+            if (self.has_pending_arm.swap(false, .seq_cst)) {
+                self.armPendingListeners(kio);
+            }
             self.iocp.doorbell.armBeforeSleep();
-            const done = blk: {
-                self.mutex.lockUncancelable(kio);
-                defer self.mutex.unlock(kio);
-                break :blk self.stopping.load(.seq_cst) and self.iocp.in_flight_count == 0;
-            };
-            if (done) {
+            if (self.has_pending_arm.load(.seq_cst)) {
+                self.iocp.doorbell.disarm();
+                continue;
+            }
+            if (self.stopping.load(.seq_cst) and self.iocp.in_flight_count == 0) {
                 self.iocp.doorbell.disarm();
                 return;
             }
             _ = self.iocp.poll(win32.INFINITE);
+            self.iocp.doorbell.disarm();
         }
     }
 
@@ -588,8 +604,9 @@ const WindowsAcceptor = struct {
         if (l.subscribed_mask == 0) return null;
         var best_shard: ?usize = null;
         var best_load: usize = std.math.maxInt(usize);
-        for (0..self.shard_count) |offset| {
-            const sid = (@as(usize, l.rr_cursor) + offset) % self.shard_count;
+        const n_shards = self.shards.len;
+        for (0..n_shards) |offset| {
+            const sid = (@as(usize, l.rr_cursor) + offset) % n_shards;
             const bit = @as(u64, 1) << @intCast(sid);
             if ((l.subscribed_mask & bit) == 0) continue;
             const load = self.shards[sid].active_load.load(.monotonic);
@@ -600,7 +617,7 @@ const WindowsAcceptor = struct {
             }
         }
         if (best_shard) |sid| {
-            l.rr_cursor = @intCast((sid + 1) % self.shard_count);
+            l.rr_cursor = @intCast((sid + 1) % n_shards);
         }
         return best_shard;
     }
@@ -623,7 +640,7 @@ const WindowsAcceptor = struct {
             win32.WSAEMFILE => error.ProcessFdQuotaExceeded,
             win32.WSAENOBUFS => error.SystemResources,
             win32.WSAENETDOWN => error.NetworkDown,
-            else => error.Unexpected,
+            else => win32.unexpectedWin32(@intCast(code)),
         };
     }
 };

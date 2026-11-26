@@ -1,11 +1,8 @@
 //! Pure shared-nothing `std.Io` backend for Zig (`epoll` on Linux, `IOCP` on Windows).
 //!
-//! Public contract (AGENTS.md §1):
-//! Only the single lifecycle entry point `Runtime` is exposed. All concurrency,
-//! networking, filesystem, and synchronization capabilities flow transparently
-//! through standard `std.Io`, while all internal submodules (`Shard`, `SpscRing`,
-//! `Mailbox`, `ShardMesh`, `TimerHeap`, `FutexTable`, `BlockingPool`, `Epoll`,
-//! `Iocp`, `fiber`, `Acceptor`) remain strictly private.
+//! Only the single lifecycle entry point `Runtime` is exposed publicly. All concurrency,
+//! networking, filesystem, and synchronization capabilities flow transparently through
+//! standard `std.Io`, while all internal submodules remain strictly private.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -39,9 +36,24 @@ test "public namespace exposes only Runtime" {
     const decl_names = @typeInfo(@This()).@"struct".decl_names;
     try std.testing.expectEqual(@as(usize, 1), decl_names.len);
     try std.testing.expectEqualStrings("Runtime", decl_names[0]);
+
+    const rt_decls = @typeInfo(Runtime).@"struct".decl_names;
+    for (rt_decls) |name| {
+        const allowed = std.mem.eql(u8, name, "InitOptions") or
+            std.mem.eql(u8, name, "InitError") or
+            std.mem.eql(u8, name, "init") or
+            std.mem.eql(u8, name, "deinit") or
+            std.mem.eql(u8, name, "shardCount") or
+            std.mem.eql(u8, name, "isStopping") or
+            std.mem.eql(u8, name, "requestStop") or
+            std.mem.eql(u8, name, "start") or
+            std.mem.eql(u8, name, "join") or
+            std.mem.eql(u8, name, "run");
+        try std.testing.expect(allowed);
+    }
 }
 
-test "Runtime single-Shard: Future async/concurrent, Group, Select, sleep, cancel, and CancelProtection" {
+test "Structured concurrency, cancel protection, and single-shot cancellation semantics" {
     var rt: Runtime = undefined;
     try rt.init(std.testing.allocator, .{ .shard_count = 1 });
     defer rt.deinit();
@@ -332,7 +344,16 @@ test "Runtime E2E: multi-Shard shared-nothing execution, cross-Shard Io.Queue vi
                 try sel.concurrent(.accepted, Io.net.Server.accept, .{ &server, io });
                 try sel.concurrent(.stopped, Io.Event.wait, .{ &st.stop_event, io });
 
-                const winner = try sel.await();
+                const winner = sel.await() catch |err| switch (err) {
+                    error.Canceled => {
+                        while (sel.cancel()) |extra| {
+                            if (extra == .accepted) {
+                                if (extra.accepted) |c| c.close(io) else |_| {}
+                            }
+                        }
+                        break;
+                    },
+                };
                 switch (winner) {
                     .accepted => |conn_res| {
                         while (sel.cancel()) |extra| {
@@ -544,7 +565,7 @@ test "Runtime E2E: ConnectionRefused, recancel, Batch timeout, socketpair, child
     }
 }
 
-test "Refactor regressions: zero-heap steady-state Io.Batch and LIFO ping-pong anti-starvation" {
+test "Zero-heap steady-state Io.Batch, OOM fallbacks, and LIFO anti-starvation" {
     // Counting/gating allocator proving Linux `Io.Batch` allocates 0 bytes on the heap in steady state!
     const GuardedAllocator = struct {
         backing: std.mem.Allocator,
@@ -686,6 +707,79 @@ test "Refactor regressions: zero-heap steady-state Io.Batch and LIFO ping-pong a
                 );
             }
 
+            // Regression 1: under OOM (`forbid_alloc = true` with >4KiB closure), `io.async` falls back
+            // inline on the parent Fiber; canceling the parent Fiber during that inline child MUST NOT be lost!
+            {
+                const InlineCancel = struct {
+                    entered: Io.Event = .unset,
+
+                    fn inlineChild(c_io: Io, st: *@This(), gp: *GuardedAllocator, pad: [4096]u8) u32 {
+                        _ = pad;
+                        gp.forbid_alloc = false;
+                        st.entered.set(c_io);
+                        c_io.sleep(.fromSeconds(5), .awake) catch {};
+                        return 77;
+                    }
+
+                    fn parentFiber(p_io: Io, st: *@This(), gp: *GuardedAllocator) !u32 {
+                        const big_pad: [4096]u8 = undefined;
+                        gp.forbid_alloc = true;
+                        var sub = p_io.async(inlineChild, .{ p_io, st, gp, big_pad });
+                        gp.forbid_alloc = false;
+                        const val = sub.await(p_io);
+                        try std.testing.expectEqual(@as(u32, 77), val);
+                        // Parent cancellation arrived while `inlineChild` was running inline:
+                        // `checkCancel()` MUST still fire `error.Canceled`!
+                        try p_io.checkCancel();
+                        return val;
+                    }
+                };
+                var ic: InlineCancel = .{};
+                var parent_fut = try io.concurrent(InlineCancel.parentFiber, .{ io, &ic, guarded_ptr });
+                try ic.entered.wait(io);
+                try io.sleep(.fromMilliseconds(1), .awake);
+                try std.testing.expectError(error.Canceled, parent_fut.cancel(io));
+            }
+
+            // Regression 2: under OOM (`forbid_alloc = true` when `TimerHeap` needs growth),
+            // `Batch.awaitConcurrent` with a finite timeout must return `error.ConcurrencyUnavailable`
+            // instead of silently dropping the timer and hanging forever!
+            if (builtin.os.tag == .linux) {
+                var sleepers: Io.Group = .init;
+                defer sleepers.cancel(io);
+                const sh = Shard.current().?;
+                while (sh.timers.heap.capacity == 0 or sh.timers.heap.items.len < sh.timers.heap.capacity) {
+                    var armed: Io.Event = .unset;
+                    try sleepers.concurrent(io, struct {
+                        fn hold(t_io: Io, ev: *Io.Event) Io.Cancelable!void {
+                            ev.set(t_io);
+                            try t_io.sleep(.fromSeconds(5), .awake);
+                        }
+                    }.hold, .{ io, &armed });
+                    armed.waitUncancelable(io);
+                }
+
+                guarded_ptr.forbid_alloc = true;
+                defer guarded_ptr.forbid_alloc = false;
+
+                var t_st: [1]Io.Operation.Storage = undefined;
+                var t_batch: Io.Batch = .init(&t_st);
+                defer t_batch.cancel(io);
+                var t_msg: [1]Io.net.IncomingMessage = .{.init};
+                var t_buf: [16]u8 = undefined;
+                _ = t_batch.add(.{ .net_receive = .{
+                    .socket_handle = udp_rx.handle,
+                    .message_buffer = &t_msg,
+                    .data_buffer = &t_buf,
+                    .flags = .{},
+                } });
+                try std.testing.expectError(
+                    error.ConcurrencyUnavailable,
+                    t_batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }),
+                );
+                t_batch.cancel(io);
+            }
+
             // Verify bounded `lifo_slot` (`max_lifo_streak = 3`) does NOT starve queued FIFO tasks during tight ping-pong!
             const PingPong = struct {
                 q_ab_buf: [1]u32 = undefined,
@@ -729,7 +823,7 @@ test "Refactor regressions: zero-heap steady-state Io.Batch and LIFO ping-pong a
     }.entry, .{&guarded});
 }
 
-test "Round 2 E2E: nested Future.await cancel propagation, reentrant stderr, zero-copy sendfile/copy_file_range, and batched sendmmsg" {
+test "Nested Future.await cancel propagation, reentrant stderr, sendfile/copy_file_range, and sendmmsg" {
     const gpa = std.testing.allocator;
     var rt: Runtime = undefined;
     try rt.init(gpa, .{
@@ -962,7 +1056,7 @@ test "Round 2 E2E: nested Future.await cancel propagation, reentrant stderr, zer
     }.entry, .{});
 }
 
-test "Round 3 E2E: Batch.awaitAsync partial OOM progress, Group multi-round reuse, zero-hop inline descriptor ops, and EPOLLET baton cascade" {
+test "Batch.awaitAsync partial OOM progress, Group reuse, inline descriptor ops, and EPOLLET baton cascade" {
     const Guard = struct {
         backing: std.mem.Allocator,
         forbid: bool = false,
@@ -1204,7 +1298,7 @@ test "Round 3 E2E: Batch.awaitAsync partial OOM progress, Group multi-round reus
     }.entry, .{&guard});
 }
 
-test "AGENTS.md regressions: Runtime InvalidCapacity, post-burst Shard timer watermark scavenging, and cross-thread futexWake" {
+test "Runtime capacity validation, idle resource scavenging, cross-thread futexWake, and graceful stop" {
     const gpa = std.testing.allocator;
 
     var bad_rt: Runtime = undefined;
@@ -1247,6 +1341,415 @@ test "AGENTS.md regressions: Runtime InvalidCapacity, post-burst Shard timer wat
                 try io.vtable.futexWait(io.userdata, &gate.raw, 0, .none);
             }
             try std.testing.expectEqual(@as(u32, 1), gate.load(.acquire));
+        }
+    }.entry, .{});
+
+    // Regression: `Runtime.requestStop()` must cancel Shards parked directly in `accept` / `sleep`
+    // without requiring an external `Io.Event`!
+    const StopState = struct {
+        ready: std.atomic.Value(usize) = .init(0),
+        accept_canceled: std.atomic.Value(bool) = .init(false),
+        sleep_canceled: std.atomic.Value(bool) = .init(false),
+    };
+    var stop_st: StopState = .{};
+    var stop_rt: Runtime = undefined;
+    try stop_rt.init(gpa, .{ .shard_count = 2 });
+    defer stop_rt.deinit();
+
+    try stop_rt.start(struct {
+        fn worker(io: Io, shard_id: usize, st: *StopState) void {
+            if (shard_id == 0) {
+                const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+                var srv = lo.listen(io, .{ .reuse_address = true }) catch unreachable;
+                defer srv.deinit(io);
+
+                const Outcome = union(enum) {
+                    conn: Io.net.Server.AcceptError!Io.net.Stream,
+                    watchdog: Io.Cancelable!void,
+                };
+                var buf: [2]Outcome = undefined;
+                var sel: Io.Select(Outcome) = .init(io, &buf);
+                sel.concurrent(.conn, Io.net.Server.accept, .{ &srv, io }) catch unreachable;
+                sel.concurrent(.watchdog, Io.sleep, .{ io, .fromMilliseconds(300), .awake }) catch unreachable;
+                _ = st.ready.fetchAdd(1, .release);
+
+                if (sel.await()) |winner| {
+                    if (winner == .conn) {
+                        if (winner.conn) |c| c.close(io) else |_| st.accept_canceled.store(true, .release);
+                    }
+                } else |err| switch (err) {
+                    error.Canceled => st.accept_canceled.store(true, .release),
+                }
+                while (sel.cancel()) |extra| {
+                    if (extra == .conn) {
+                        if (extra.conn) |c| c.close(io) else |_| {}
+                    }
+                }
+            } else {
+                _ = st.ready.fetchAdd(1, .release);
+                io.sleep(.fromMilliseconds(300), .awake) catch |err| switch (err) {
+                    error.Canceled => st.sleep_canceled.store(true, .release),
+                };
+            }
+        }
+    }.worker, .{&stop_st});
+
+    while (stop_st.ready.load(.acquire) < 2) {
+        std.Thread.yield() catch {};
+    }
+    // Give Shard 0 & 1 a brief moment to park inside `epoll_wait` / `IOCP` before stopping.
+    Io.Threaded.global_single_threaded.io().sleep(.fromMilliseconds(5), .awake) catch {};
+    stop_rt.requestStop();
+    stop_rt.join();
+    try std.testing.expect(stop_st.accept_canceled.load(.acquire));
+    try std.testing.expect(stop_st.sleep_canceled.load(.acquire));
+
+    // Regression: independent ephemeral `port 0` listeners with `reuse_address = true` on
+    // multiple Shards must each bind a distinct non-zero ephemeral port (never falsely coalesce).
+    var ports: [2]u16 = .{ 0, 0 };
+    var port_rt: Runtime = undefined;
+    try port_rt.init(gpa, .{ .shard_count = 2 });
+    defer port_rt.deinit();
+    try port_rt.run(struct {
+        fn bindEphemeral(io: Io, idx: usize, out: *[2]u16) !void {
+            const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            var srv = try lo.listen(io, .{ .reuse_address = true });
+            defer srv.deinit(io);
+            out[idx] = srv.socket.address.getPort();
+        }
+    }.bindEphemeral, .{&ports});
+    try std.testing.expect(ports[0] != 0 and ports[1] != 0);
+    try std.testing.expect(ports[0] != ports[1]);
+}
+
+test "Child.wait cancellation preserves child handle for kill, completed void blocking ops retain success, and zero-timeout Batch polls kernel" {
+    const gpa = std.testing.allocator;
+    var rt: Runtime = undefined;
+    try rt.init(gpa, .{ .shard_count = 1, .blocking_threads = 1 });
+    defer rt.deinit();
+
+    try rt.run(struct {
+        fn entry(io: Io) !void {
+            // 1. Zero-timeout `Batch.awaitConcurrent` must harvest newly arrived kernel completions
+            //    on already-pending operations instead of livelocking with `error.Timeout`.
+            {
+                const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+                const rx = try lo.bind(io, .{ .mode = .dgram });
+                defer rx.close(io);
+                const tx = try lo.bind(io, .{ .mode = .dgram });
+                defer tx.close(io);
+
+                var st: [1]Io.Operation.Storage = undefined;
+                var batch: Io.Batch = .init(&st);
+                defer batch.cancel(io);
+
+                var msg: [1]Io.net.IncomingMessage = .{.init};
+                var buf: [32]u8 = undefined;
+                _ = batch.add(.{ .net_receive = .{
+                    .socket_handle = rx.handle,
+                    .message_buffer = &msg,
+                    .data_buffer = &buf,
+                    .flags = .{},
+                } });
+
+                // Park operation in `batch.pending` first:
+                try std.testing.expectError(
+                    error.Timeout,
+                    batch.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }),
+                );
+
+                // Send packet without yielding to `idle_fiber`, then poll with `.zero` timeout:
+                try tx.send(io, &rx.address, "zero-poll");
+                var harvested = false;
+                for (0..64) |_| {
+                    if (batch.awaitConcurrent(io, .{ .duration = .{ .raw = .zero, .clock = .awake } })) |_| {
+                        harvested = true;
+                        break;
+                    } else |err| switch (err) {
+                        error.Timeout => std.Thread.yield() catch {},
+                        else => return err,
+                    }
+                }
+                try std.testing.expect(harvested);
+                const comp = batch.next().?;
+                try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, null), comp.result.net_receive[0]);
+                try std.testing.expectEqualStrings("zero-poll", msg[0].data);
+            }
+
+            // 2. Completed `!void` blocking operation (`file.lock`) must NOT be forged into
+            //    `error.Canceled` if cancellation arrives while the worker job is in flight,
+            //    which would otherwise leak the acquired OS file lock!
+            {
+                const cwd = Io.Dir.cwd();
+                try cwd.createDirPath(io, ".zig-cache/islet-lock-cancel");
+                defer cwd.deleteDir(io, ".zig-cache/islet-lock-cancel") catch {};
+                const lock_path = ".zig-cache/islet-lock-cancel/f.lock";
+                defer cwd.deleteFile(io, lock_path) catch {};
+
+                const f1 = try cwd.createFile(io, lock_path, .{ .truncate = true, .read = true });
+                defer f1.close(io);
+                const f2 = try cwd.openFile(io, lock_path, .{ .mode = .read_write });
+                defer f2.close(io);
+
+                // Hold exclusive lock on `f1` so `f2.lock` blocks inside `BlockingPool` worker!
+                try f1.lock(io, .exclusive);
+                var f1_locked = true;
+                defer if (f1_locked) f1.unlock(io);
+
+                const LockWorker = struct {
+                    entered: Io.Event = .unset,
+                    saw_post_lock_cancel: bool = false,
+
+                    fn run(t_io: Io, file: Io.File, self: *@This()) Io.File.LockError!void {
+                        self.entered.set(t_io);
+                        try file.lock(t_io, .exclusive);
+                        defer file.unlock(t_io);
+                        // Lock succeeded: pending cancel MUST surface at the next cancel point instead!
+                        t_io.checkCancel() catch |err| switch (err) {
+                            error.Canceled => {
+                                self.saw_post_lock_cancel = true;
+                                return error.Canceled;
+                            },
+                        };
+                    }
+                };
+
+                var lw: LockWorker = .{};
+                var lock_fut = try io.concurrent(LockWorker.run, .{ io, f2, &lw });
+                try lw.entered.wait(io);
+                // Give worker thread a moment to block inside kernel `flock`
+                try io.sleep(.fromMilliseconds(2), .awake);
+
+                // Release `f1` right after requesting cancel on `lock_fut`:
+                var unlocker = try io.concurrent(struct {
+                    fn release(t_io: Io, file: Io.File, flag: *bool) void {
+                        t_io.sleep(.fromMilliseconds(1), .awake) catch {};
+                        file.unlock(t_io);
+                        flag.* = false;
+                    }
+                }.release, .{ io, f1, &f1_locked });
+                defer unlocker.await(io);
+
+                try std.testing.expectError(error.Canceled, lock_fut.cancel(io));
+                try std.testing.expect(lw.saw_post_lock_cancel);
+                // Verify `f2` properly unlocked the file (not leaked!):
+                try std.testing.expect(try f1.tryLock(io, .exclusive));
+                f1.unlock(io);
+            }
+
+            // 3. Reentrant `lockStderr` and empty `Group.await` must act as cancellation points when `.unblocked`:
+            {
+                var b1: [16]u8 = undefined;
+                var b2: [16]u8 = undefined;
+                var fut = try io.concurrent(struct {
+                    fn run(t_io: Io, buf1: []u8, buf2: []u8) Io.Cancelable!void {
+                        _ = try t_io.lockStderr(buf1, .no_color);
+                        defer t_io.unlockStderr();
+                        t_io.sleep(.fromSeconds(5), .awake) catch |err| switch (err) {
+                            error.Canceled => t_io.recancel(),
+                        };
+                        _ = try t_io.lockStderr(buf2, .no_color);
+                        t_io.unlockStderr();
+                    }
+                }.run, .{ io, &b1, &b2 });
+                try io.sleep(.fromMilliseconds(1), .awake);
+                try std.testing.expectError(error.Canceled, fut.cancel(io));
+
+                var grp_fut = try io.concurrent(struct {
+                    fn run(t_io: Io) Io.Cancelable!void {
+                        var empty_grp: Io.Group = .init;
+                        t_io.sleep(.fromSeconds(5), .awake) catch |err| switch (err) {
+                            error.Canceled => t_io.recancel(),
+                        };
+                        var dummy_tok: u8 = 0;
+                        try t_io.vtable.groupAwait(t_io.userdata, &empty_grp, &dummy_tok);
+                    }
+                }.run, .{io});
+                try io.sleep(.fromMilliseconds(1), .awake);
+                try std.testing.expectError(error.Canceled, grp_fut.cancel(io));
+            }
+
+            // 4. Linux: canceling `child.wait(io)` while parked on `pidfd` MUST preserve `child.id`
+            //    so `defer child.kill(io)` terminates and reaps the child without leaking orphans!
+            if (builtin.os.tag == .linux) {
+                var child = try std.process.spawn(io, .{
+                    .argv = &.{ "/bin/sleep", "30" },
+                    .stdin = .ignore,
+                    .stdout = .pipe,
+                    .stderr = .pipe,
+                });
+                const spawned_pid = child.id.?;
+
+                var wait_fut = try io.concurrent(struct {
+                    fn waitIt(t_io: Io, c: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
+                        return c.wait(t_io);
+                    }
+                }.waitIt, .{ io, &child });
+
+                // Let `waitIt` enter `pidfd_open` + `Epoll` wait:
+                try io.sleep(.fromMilliseconds(2), .awake);
+                try std.testing.expectError(error.Canceled, wait_fut.cancel(io));
+
+                // `child.id` MUST still be intact so `child.kill(io)` actually kills and reaps it!
+                try std.testing.expectEqual(@as(?std.posix.pid_t, spawned_pid), child.id);
+                child.kill(io);
+                try std.testing.expectEqual(@as(?std.posix.pid_t, null), child.id);
+
+                // Verify OS process is genuinely reaped (`kill(pid, 0)` -> `ESRCH`):
+                const probe_rc = std.os.linux.kill(spawned_pid, @fromBackingInt(@intCast(0)));
+                try std.testing.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(probe_rc));
+            }
+        }
+    }.entry, .{});
+}
+
+test "Broken pipe returns error.BrokenPipe without SIGPIPE, netLookup handles empty/closed queue, and child.wait collects rusage" {
+    const gpa = std.testing.allocator;
+    var rt: Runtime = undefined;
+    try rt.init(gpa, .{ .shard_count = 1, .blocking_threads = 1 });
+    defer rt.deinit();
+
+    try rt.run(struct {
+        fn entry(io: Io) !void {
+            // 1. Empty HostName must return `error.UnknownHostName` (no OOB panic), and
+            //    closing `resolved` before `lookup` must return `error.Closed` (no `unreachable` panic):
+            {
+                var qbuf: [4]Io.net.HostName.LookupResult = undefined;
+                var q_empty: Io.Queue(Io.net.HostName.LookupResult) = .init(&qbuf);
+                const empty_hn: Io.net.HostName = .{ .bytes = "" };
+                try std.testing.expectError(
+                    error.UnknownHostName,
+                    io.vtable.netLookup(io.userdata, empty_hn, &q_empty, .{ .port = 80 }),
+                );
+
+                var q_closed: Io.Queue(Io.net.HostName.LookupResult) = .init(&qbuf);
+                q_closed.close(io);
+                const lo_hn = try Io.net.HostName.init("localhost");
+                try io.vtable.netLookup(io.userdata, lo_hn, &q_closed, .{ .port = 80 });
+            }
+
+            // 2. Writing to a broken pipe must return `error.BrokenPipe` cleanly (never kill process via `SIGPIPE`),
+            //    and `child.wait` with `request_resource_usage_statistics = true` must populate `rusage` and close pipes:
+            if (builtin.os.tag == .linux) {
+                var child = try std.process.spawn(io, .{
+                    .argv = &.{"/bin/true"},
+                    .stdin = .pipe,
+                    .stdout = .pipe,
+                    .stderr = .pipe,
+                    .request_resource_usage_statistics = true,
+                });
+                const stdin_pipe = child.stdin.?;
+                child.stdin = null;
+                defer stdin_pipe.close(io);
+
+                const term = try child.wait(io);
+                try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+                try std.testing.expectEqual(@as(?Io.File, null), child.stdout);
+                try std.testing.expectEqual(@as(?Io.File, null), child.stderr);
+                try std.testing.expect(child.resource_usage_statistics.getMaxRss() != null);
+
+                // Child has exited and closed its read end of `stdin_pipe`: streaming write MUST
+                // surface `error.BrokenPipe` instead of terminating the test process with `SIGPIPE`!
+                const op_res = try io.operate(.{ .file_write_streaming = .{
+                    .file = stdin_pipe,
+                    .header = "broken-pipe-probe",
+                    .data = &.{},
+                    .splat = 0,
+                } });
+                try std.testing.expectError(error.BrokenPipe, op_res.file_write_streaming);
+            }
+        }
+    }.entry, .{});
+}
+
+test "Timed-out or canceled Batch await leaves no driver state behind (std.Io.operateTimeout drops its Batch), and completed pool operations survive" {
+    var rt: Runtime = undefined;
+    try rt.init(std.testing.allocator, .{ .shard_count = 1, .blocking_threads = 1 });
+    defer rt.deinit();
+
+    try rt.run(struct {
+        fn receiveLong(r_io: Io, sock: *const Io.net.Socket, buf: []u8) Io.net.Socket.ReceiveTimeoutError!Io.net.IncomingMessage {
+            return sock.receiveTimeout(r_io, buf, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
+        }
+
+        fn writeLater(w_io: Io, file: Io.File) Io.Cancelable!void {
+            try w_io.sleep(.fromMilliseconds(20), .awake);
+            file.writeStreamingAll(w_io, "late") catch {};
+        }
+
+        fn entry(io: Io) !void {
+            const lo: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            const udp = try lo.bind(io, .{ .mode = .dgram });
+            defer udp.close(io);
+            var buf: [16]u8 = undefined;
+
+            // 1. `receiveTimeout` -> `operateTimeout` abandons its stack `Batch` on `error.Timeout`:
+            //    the next operation on the same socket must not touch that dead frame.
+            try std.testing.expectError(
+                error.Timeout,
+                udp.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromMilliseconds(2), .clock = .awake } }),
+            );
+            try udp.send(io, &udp.address, "after-timeout");
+            const m1 = try udp.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try std.testing.expectEqualStrings("after-timeout", m1.data);
+
+            // 2. Same abandonment on `error.Canceled`.
+            var canceled_buf: [16]u8 = undefined;
+            var recv_future = try io.concurrent(receiveLong, .{ io, &udp, &canceled_buf });
+            try io.sleep(.fromMilliseconds(1), .awake);
+            try std.testing.expectError(error.Canceled, recv_future.cancel(io));
+            try udp.send(io, &udp.address, "after-cancel");
+            const m2 = try udp.receive(io, &buf);
+            try std.testing.expectEqualStrings("after-cancel", m2.data);
+
+            // 3. A timed-out operation is still owed to a caller that keeps its `Batch`:
+            //    the next await resubmits it and observes the datagram.
+            var storage: [1]Io.Operation.Storage = undefined;
+            var batch: Io.Batch = .init(&storage);
+            defer batch.cancel(io);
+            var in_msg: [1]Io.net.IncomingMessage = .{.init};
+            var dgram_buf: [16]u8 = undefined;
+            _ = batch.add(.{ .net_receive = .{
+                .socket_handle = udp.handle,
+                .message_buffer = &in_msg,
+                .data_buffer = &dgram_buf,
+                .flags = .{},
+            } });
+            try std.testing.expectError(
+                error.Timeout,
+                batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromMilliseconds(2), .clock = .awake } }),
+            );
+            try udp.send(io, &udp.address, "resubmitted");
+            try batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const comp = batch.next().?;
+            const recv_err, const recv_count = comp.result.net_receive;
+            try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, null), recv_err);
+            try std.testing.expectEqual(@as(usize, 1), recv_count);
+            try std.testing.expectEqualStrings("resubmitted", in_msg[0].data);
+
+            // 4. A `BlockingPool` worker already inside a blocking `read` cannot be withdrawn: the
+            //    timed-out await reaps it instead, and its consumed bytes are reported, not dropped.
+            if (builtin.os.tag == .linux) {
+                const fds = try Io.Threaded.pipe2(.{ .CLOEXEC = true });
+                const pipe_r: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+                const pipe_w: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+                defer pipe_r.close(io);
+                defer pipe_w.close(io);
+
+                var writer_future = try io.concurrent(writeLater, .{ io, pipe_w });
+                defer writer_future.cancel(io) catch {};
+
+                var pipe_buf: [8]u8 = undefined;
+                var pipe_vec: [1][]u8 = .{&pipe_buf};
+                var pipe_storage: [1]Io.Operation.Storage = undefined;
+                var pipe_batch: Io.Batch = .init(&pipe_storage);
+                defer pipe_batch.cancel(io);
+                _ = pipe_batch.add(.{ .file_read_streaming = .{ .file = pipe_r, .data = &pipe_vec } });
+                try pipe_batch.awaitConcurrent(io, .{ .duration = .{ .raw = .fromMilliseconds(2), .clock = .awake } });
+                const pipe_comp = pipe_batch.next().?;
+                try std.testing.expectEqual(@as(usize, 4), try pipe_comp.result.file_read_streaming);
+                try std.testing.expectEqualStrings("late", pipe_buf[0..4]);
+            }
         }
     }.entry, .{});
 }

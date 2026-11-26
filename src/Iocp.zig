@@ -1,13 +1,10 @@
 //! Windows `IOCP` completion multiplexer per Shard.
 //!
-//! Design invariants (AGENTS.md §4):
 //! - Exclusive IOCP handle (`NumberOfConcurrentThreads = 1`) per Shard, harvested
 //!   in batches via `GetQueuedCompletionStatusEx`.
 //! - Enables `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE`
 //!   on IFS sockets and overlapped file/pipe handles so synchronous completions
-//!   return immediately in user space without Fiber context switching or IOCP traffic,
-//!   while tracking non-IFS legacy handles safely.
-//! - Coalesced cross-thread doorbell via `PostQueuedCompletionStatus`.
+//!   return immediately without IOCP traffic, while tracking legacy handles safely.
 //! - Tracks `in_flight_count` strictly: every kernel-owned `OVERLAPPED` increments
 //!   `in_flight_count` on pending submission and decrements ONLY when popped from
 //!   IOCP. Destroying `Iocp` while `in_flight_count != 0` triggers `@panic`.
@@ -23,6 +20,7 @@ const Doorbell = Mailbox.Doorbell;
 const Iocp = @This();
 
 const wakeup_key: win32.ULONG_PTR = std.math.maxInt(win32.ULONG_PTR);
+const max_cached_legacy_handles: usize = 64;
 
 pub const InitError = error{
     SystemResources,
@@ -110,6 +108,32 @@ pub fn associateSocket(
         }
     }
     try self.legacy_handles.append(gpa, handle);
+}
+
+/// Associates an overlapped pipe/file `HANDLE` (e.g. child process stdio pipe or
+/// inherited overlapped file) with this Shard's IOCP and enables skip-on-success
+/// notification mode when supported by the underlying kernel driver.
+pub fn associateOverlappedHandle(
+    self: *Iocp,
+    gpa: Allocator,
+    handle: win32.HANDLE,
+) (Allocator.Error || error{ NotOverlapped, Unexpected })!void {
+    if (win32.CreateIoCompletionPort(handle, self.iocp_handle, 0, 0) == null) {
+        return switch (windows.GetLastError()) {
+            .INVALID_PARAMETER, .INVALID_HANDLE => error.NotOverlapped,
+            else => |err| windows.unexpectedError(err),
+        };
+    }
+    const mode = win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | win32.FILE_SKIP_SET_EVENT_ON_HANDLE;
+    if (!win32.SetFileCompletionNotificationModes(handle, mode).toBool()) {
+        try self.legacy_handles.append(gpa, handle);
+    }
+}
+
+pub fn scavengeIdle(self: *Iocp, gpa: Allocator) void {
+    if (self.legacy_handles.items.len == 0 and self.legacy_handles.capacity > max_cached_legacy_handles) {
+        self.legacy_handles.clearAndFree(gpa);
+    }
 }
 
 pub fn unregisterHandle(self: *Iocp, handle: win32.HANDLE) void {

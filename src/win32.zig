@@ -28,18 +28,29 @@ pub const INFINITE: DWORD = 0xFFFFFFFF;
 pub const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: UCHAR = 0x1;
 pub const FILE_SKIP_SET_EVENT_ON_HANDLE: UCHAR = 0x2;
 
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_INVALID_HANDLE: u32 = 6;
+pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 pub const ERROR_ALREADY_FIBER: u32 = 1280;
 pub const ERROR_IO_PENDING: u32 = 997;
 pub const ERROR_OPERATION_ABORTED: u32 = 995;
 pub const ERROR_NOT_FOUND: u32 = 1168;
 pub const ERROR_HANDLE_EOF: u32 = 38;
 pub const ERROR_BROKEN_PIPE: u32 = 109;
+pub const ERROR_DISK_FULL: u32 = 112;
 pub const ERROR_NETNAME_DELETED: u32 = 64;
 pub const ERROR_CONNECTION_REFUSED: u32 = 1225;
 pub const ERROR_PORT_UNREACHABLE: u32 = 1234;
 pub const ERROR_CONNECTION_ABORTED: u32 = 1236;
+pub const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
 pub const ERROR_SEM_TIMEOUT: u32 = 121;
 pub const WAIT_TIMEOUT: u32 = 258;
+
+pub inline fn unexpectedWin32(code: u32) std.Io.UnexpectedError {
+    return windows.unexpectedError(@fromBackingInt(@as(u16, @truncate(code))));
+}
 
 // ── IOCP (`kernel32`) ────────────────────────────────────────────────────────
 

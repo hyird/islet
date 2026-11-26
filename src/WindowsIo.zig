@@ -1,17 +1,14 @@
 //! Windows `IOCP` data-plane I/O driver, `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`
 //! synchronous fast path, shared `Acceptor` adoption, and bounded `Io.Batch` engine.
 //!
-//! Design invariants (AGENTS.md §2, §4, §5):
 //! - Concentrates all Win32/Winsock2/IOCP `OVERLAPPED` state machines out of generic
 //!   `Shard` scheduling.
-//! - Enforces the `OVERLAPPED` lifetime iron law: cancelled or timed-out pending
-//!   I/O issues `CancelIoEx` and waits UNCANCELABLY until the completion packet
+//! - Enforces the `OVERLAPPED` lifetime contract: canceled or timed-out pending
+//!   I/O issues `CancelIoEx` and waits uncancelably until the completion packet
 //!   exits `GetQueuedCompletionStatusEx`.
-//! - Exploits `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on IFS handles so immediate
-//!   reads/writes/sends/receives complete synchronously with zero Fiber switches
-//!   and zero heap allocations (including inside `Io.Batch`).
-//! - Uses `RtlNtStatusToDosError` unified error translation across single `operate`
-//!   and `Io.Batch`, and bounds cached `BatchOp` descriptors (`max_cached = 64`).
+//! - Exploits `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on IFS sockets and overlapped
+//!   pipe/file handles so immediate I/O completes synchronously without IOCP traffic.
+//! - Uses `RtlNtStatusToDosError` unified error translation across `operate` and `Io.Batch`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -35,8 +32,6 @@ const Acceptor = AcceptorMod.Acceptor;
 const AcceptedSocket = AcceptorMod.AcceptedSocket;
 
 const WindowsIo = @This();
-
-const max_cached_batch_ops: usize = 64;
 
 pub const InitError = Iocp.InitError;
 
@@ -88,12 +83,11 @@ const SharedAcceptQueue = struct {
 };
 
 const BatchOp = struct {
-    free_next: ?*BatchOp = null,
     driver: *WindowsIo = undefined,
     batch: *Io.Batch = undefined,
     slot_index: u32 = 0,
     op: Io.Operation = undefined,
-    canceled: bool = false,
+    withdrawn: bool = false,
     result: ?Io.Operation.Result = null,
     backend: union(enum) {
         none,
@@ -102,6 +96,7 @@ const BatchOp = struct {
             comp: Iocp.Completion,
             wsabufs: [Threaded.max_iovecs_len]win32.WSABUF = undefined,
             splat_buf: [Threaded.splat_buffer_size]u8 = undefined,
+            wmsg: win32.WSAMSG = undefined,
             dw_flags: win32.DWORD = 0,
             from_addr: Threaded.PosixAddress = undefined,
             from_len: c_int = @sizeOf(Threaded.PosixAddress),
@@ -118,9 +113,8 @@ blocking_pool: *BlockingPool,
 resume_lane: *ResumeLane,
 owner_ctx: *anyopaque,
 wake_task_fn: *const fn (owner_ctx: *anyopaque, task_ptr: *anyopaque) void,
-batch_op_free: ?*BatchOp = null,
-cached_batch_ops: usize = 0,
 pending_batch_count: usize = 0,
+subscribed_listeners: u64 = 0,
 shared_accepts: [64]SharedAcceptQueue = @splat(.{}),
 
 /// Initializes `self` in-place (address-pinned).
@@ -151,18 +145,17 @@ pub fn init(
     }
 }
 
-pub fn deinit(self: *WindowsIo, gpa: Allocator) void {
+pub fn assertQuiescent(self: *const WindowsIo) void {
     if (self.pending_batch_count != 0) {
-        @panic("islet.WindowsIo.deinit: Io.Batch pending operations were not awaited or canceled");
+        @panic("islet.WindowsIo: Io.Batch pending operations were not awaited or canceled");
     }
-    var cur = self.batch_op_free;
-    self.batch_op_free = null;
-    self.cached_batch_ops = 0;
-    while (cur) |op| {
-        const next = op.free_next;
-        gpa.destroy(op);
-        cur = next;
+    if (self.poller.in_flight_count != 0) {
+        @panic("islet.WindowsIo: in-flight OVERLAPPED operations not drained");
     }
+}
+
+pub fn deinit(self: *WindowsIo, gpa: Allocator) void {
+    self.assertQuiescent();
     for (&self.shared_accepts) |*q| {
         q.deinit(gpa);
     }
@@ -202,6 +195,12 @@ pub fn drainAcceptor(self: *WindowsIo) void {
 
 fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
     const self: *WindowsIo = @ptrCast(@alignCast(ctx.?));
+    const acc = self.acceptor.?;
+    if ((self.subscribed_listeners & (@as(u64, 1) << @intCast(accepted.listener_id))) == 0) {
+        acc.releaseShardLoad(self.shard_id);
+        _ = win32.closesocket(accepted.raw_sock);
+        return;
+    }
     const q = &self.shared_accepts[accepted.listener_id];
     if (q.waiter_head) |w| {
         q.waiter_head = w.next;
@@ -217,7 +216,6 @@ fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
         self.wake_task_fn(self.owner_ctx, w.task_ptr);
         return;
     }
-    const acc = self.acceptor.?;
     if (!q.pushBounded(self.gpa, acc.inboxCapacity(), accepted)) {
         acc.releaseShardLoad(self.shard_id);
         _ = win32.closesocket(accepted.raw_sock);
@@ -226,18 +224,34 @@ fn onAcceptedSocket(ctx: ?*anyopaque, accepted: AcceptedSocket) void {
 
 pub fn onStopRequested(self: *WindowsIo) void {
     for (&self.shared_accepts) |*q| {
-        var cur = q.waiter_head;
-        q.waiter_head = null;
-        q.waiter_tail = null;
-        while (cur) |w| {
-            const next = w.next;
-            w.prev = null;
-            w.next = null;
-            w.linked = false;
-            w.canceled = true;
-            self.wake_task_fn(self.owner_ctx, w.task_ptr);
-            cur = next;
+        self.wakeAllAcceptWaiters(q);
+    }
+}
+
+pub fn scavengeIdle(self: *WindowsIo, gpa: Allocator) void {
+    self.poller.scavengeIdle(gpa);
+    for (&self.shared_accepts, 0..) |*q, idx| {
+        if (q.ring.len != 0 and q.len() == 0 and (self.subscribed_listeners & (@as(u64, 1) << @intCast(idx))) == 0) {
+            gpa.free(q.ring);
+            q.ring = &.{};
+            q.head = 0;
+            q.tail = 0;
         }
+    }
+}
+
+fn wakeAllAcceptWaiters(self: *WindowsIo, q: *SharedAcceptQueue) void {
+    var cur = q.waiter_head;
+    q.waiter_head = null;
+    q.waiter_tail = null;
+    while (cur) |w| {
+        const next = w.next;
+        w.prev = null;
+        w.next = null;
+        w.linked = false;
+        w.canceled = true;
+        self.wake_task_fn(self.owner_ctx, w.task_ptr);
+        cur = next;
     }
 }
 
@@ -247,18 +261,6 @@ pub fn poll(self: *WindowsIo, wait_ns: ?i96) usize {
     else
         win32.INFINITE;
     return self.poller.poll(timeout_ms);
-}
-
-// ── Clock ───────────────────────────────────────────────────────────────────
-
-pub fn now(self: *WindowsIo, clock: Io.Clock) Io.Timestamp {
-    const t_io = self.blocking_pool.threaded.io();
-    return t_io.vtable.now(t_io.userdata, clock);
-}
-
-pub fn clockResolution(self: *WindowsIo, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
-    const t_io = self.blocking_pool.threaded.io();
-    return t_io.vtable.clockResolution(t_io.userdata, clock);
 }
 
 // ── File / Dir / Child Process Lifecycle ────────────────────────────────────
@@ -277,87 +279,47 @@ pub fn dirClose(_: *WindowsIo, dirs: []const Dir) void {
 }
 
 pub fn fileWriteFileStreaming(
-    self: *WindowsIo,
-    shard: anytype,
-    file: File,
-    header: []const u8,
+    _: *WindowsIo,
+    _: anytype,
+    _: File,
+    _: []const u8,
     file_reader: *File.Reader,
-    limit: Io.Limit,
+    _: Io.Limit,
 ) File.Writer.WriteFileError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
-    const reader_buffered = file_reader.interface.buffered();
-    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
-    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
-        const op_res = try self.operate(shard, .{ .file_write_streaming = .{
-            .file = file,
-            .header = header,
-            .data = &.{limit.slice(reader_buffered)},
-            .splat = 1,
-        } });
-        const n = try op_res.file_write_streaming;
-        file_reader.interface.toss(n -| header.len);
-        return n;
-    }
-    return if (at_eof) error.EndOfStream else error.Unimplemented;
+    return error.Unimplemented;
 }
 
 pub fn fileWriteFilePositional(
     _: *WindowsIo,
-    shard: anytype,
-    file: File,
-    header: []const u8,
+    _: anytype,
+    _: File,
+    _: []const u8,
     file_reader: *File.Reader,
-    limit: Io.Limit,
-    offset: u64,
+    _: Io.Limit,
+    _: u64,
 ) File.WriteFilePositionalError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
-    const reader_buffered = file_reader.interface.buffered();
-    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
-    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
-        const shard_io = shard.io();
-        const n = try shard_io.vtable.fileWritePositional(
-            shard_io.userdata,
-            file,
-            header,
-            &.{limit.slice(reader_buffered)},
-            1,
-            offset,
-        );
-        file_reader.interface.toss(n -| header.len);
-        return n;
+    return error.Unimplemented;
+}
+
+pub fn adoptNonblockingFile(self: *WindowsIo, file: *File) void {
+    if (!file.flags.nonblocking) return;
+    self.poller.associateOverlappedHandle(self.gpa, file.handle) catch {
+        file.flags.nonblocking = false;
+    };
+}
+
+pub fn afterProcessSpawn(self: *WindowsIo, child: *std.process.Child) void {
+    inline for (.{ "stdin", "stdout", "stderr" }) |pipe_field| {
+        if (@field(child, pipe_field)) |*f| {
+            self.adoptNonblockingFile(f);
+        }
     }
-    return if (at_eof) error.EndOfStream else error.Unimplemented;
 }
 
-pub fn processSpawn(_: *WindowsIo, shard: anytype, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
-    var sanitized = options;
-    sanitized.progress_node = .none;
-
-    return shard.callBlocking(true, struct {
-        fn run(t: *Threaded, opts: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
-            const t_io = t.io();
-            return t_io.vtable.processSpawn(t_io.userdata, opts);
-        }
-    }.run, .{sanitized});
-}
-
-pub fn childWait(_: *WindowsIo, shard: anytype, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
-    try shard.checkCancelPoint();
-    return shard.callBlocking(true, struct {
-        fn run(t: *Threaded, c: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
-            const t_io = t.io();
-            return t_io.vtable.childWait(t_io.userdata, c);
-        }
-    }.run, .{child});
-}
-
-pub fn childKill(_: *WindowsIo, shard: anytype, child: *std.process.Child) void {
-    shard.callBlocking(false, struct {
-        fn run(t: *Threaded, c: *std.process.Child) void {
-            const t_io = t.io();
-            t_io.vtable.childKill(t_io.userdata, c);
-        }
-    }.run, .{child});
+pub inline fn waitChildFast(_: *WindowsIo, _: anytype, _: *std.process.Child) Io.Cancelable!bool {
+    return false;
 }
 
 // ── IOCP Single-Operation Wait (`OVERLAPPED` Iron Law) ──────────────────────
@@ -366,16 +328,15 @@ const IocpWaitResult = struct {
     bytes: u32,
     nt_status: windows.NTSTATUS,
     timed_out: bool,
+    oom: bool,
 };
 
 fn awaitPending(
-    self: *WindowsIo,
     shard: anytype,
     handle: win32.HANDLE,
     comp: *Iocp.Completion,
     maybe_deadline_ns: ?i96,
 ) Io.Cancelable!IocpWaitResult {
-    _ = self;
     const TaskPtr = @TypeOf(shard.current_task);
     const ShardPtr = @TypeOf(shard);
 
@@ -386,6 +347,7 @@ fn awaitPending(
         comp: *Iocp.Completion,
         timer_token: TimerHeap.Token = .inactive,
         timed_out: bool = false,
+        oom: bool = false,
         canceled: bool = false,
 
         fn onComplete(c: *Iocp.Completion) void {
@@ -435,7 +397,10 @@ fn awaitPending(
                 Iocp.requestCancelIo(handle, comp);
             } else if (shard.timers.schedule(shard.gpa, dl, &st, State.onTimer)) |tok| {
                 st.timer_token = tok;
-            } else |_| {}
+            } else |_| {
+                st.oom = true;
+                Iocp.requestCancelIo(handle, comp);
+            }
         }
         cur.cancel_hook = .{ .ctx = &st, .trigger = State.onCancel };
     }
@@ -457,6 +422,7 @@ fn awaitPending(
         .bytes = comp.bytes_transferred,
         .nt_status = comp.nt_status,
         .timed_out = st.timed_out,
+        .oom = st.oom,
     };
 }
 
@@ -528,15 +494,37 @@ fn firstWriteSlice(header: []const u8, data: []const []const u8, splat: usize) ?
     return null;
 }
 
-fn blockingOperateOnThreaded(t: *Threaded, op: Io.Operation) Io.Operation.Result {
-    const t_io = t.io();
-    return t_io.vtable.operate(t_io.userdata, op) catch |err| switch (err) {
-        error.Canceled => unreachable,
-    };
+const OverlappedLaunch = union(enum) {
+    sync_done,
+    pending,
+    win32_err: u32,
+};
+
+inline fn classifyWin32Launch(self: *const WindowsIo, handle: win32.HANDLE, ok: win32.BOOL) OverlappedLaunch {
+    if (ok.toBool()) {
+        return if (self.poller.hasSkipOnSuccess(handle)) .sync_done else .pending;
+    }
+    const err = @backingInt(windows.GetLastError());
+    return if (err == win32.ERROR_IO_PENDING) .pending else .{ .win32_err = err };
 }
 
-fn runBlockingOperate(t: *Threaded, op_arg: Io.Operation) Io.Cancelable!Io.Operation.Result {
-    return blockingOperateOnThreaded(t, op_arg);
+const WinsockLaunch = union(enum) {
+    sync_done,
+    pending,
+    wsa_err: c_int,
+};
+
+inline fn classifyWinsockLaunch(self: *const WindowsIo, handle: win32.HANDLE, rc: c_int) WinsockLaunch {
+    if (rc == 0) {
+        return if (self.poller.hasSkipOnSuccess(handle)) .sync_done else .pending;
+    }
+    const werr = win32.WSAGetLastError();
+    return if (werr == win32.WSA_IO_PENDING) .pending else .{ .wsa_err = werr };
+}
+
+fn blockingOperateOnThreaded(t: *Threaded, op: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    const t_io = t.io();
+    return t_io.vtable.operate(t_io.userdata, op);
 }
 
 pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
@@ -545,7 +533,7 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
     switch (operation) {
         .file_read_streaming => |o| {
             if (!o.file.flags.nonblocking) {
-                return shard.callBlocking(true, runBlockingOperate, .{operation});
+                return shard.callBlocking(true, blockingOperateOnThreaded, .{operation});
             }
             const dest = for (o.data) |b| {
                 if (b.len > 0) break b;
@@ -560,18 +548,13 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                 &sync_bytes,
                 &comp.overlapped,
             );
-            if (ok.toBool()) {
-                if (self.poller.hasSkipOnSuccess(o.file.handle)) {
-                    return .{ .file_read_streaming = if (sync_bytes == 0) error.EndOfStream else sync_bytes };
-                }
-            } else {
-                const err = @backingInt(windows.GetLastError());
-                if (err != win32.ERROR_IO_PENDING) {
-                    return .{ .file_read_streaming = mapFileReadError(err) };
-                }
+            switch (self.classifyWin32Launch(o.file.handle, ok)) {
+                .sync_done => return .{ .file_read_streaming = if (sync_bytes == 0) error.EndOfStream else sync_bytes },
+                .win32_err => |err| return .{ .file_read_streaming = mapFileReadError(err) },
+                .pending => {},
             }
             self.poller.recordPending(&comp);
-            const res = try self.awaitPending(shard, o.file.handle, &comp, null);
+            const res = try awaitPending(shard, o.file.handle, &comp, null);
             if (res.nt_status != .SUCCESS) {
                 return .{ .file_read_streaming = mapFileReadError(Iocp.ntStatusToWin32Error(res.nt_status)) };
             }
@@ -579,7 +562,7 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
         },
         .file_write_streaming => |o| {
             if (!o.file.flags.nonblocking) {
-                return shard.callBlocking(true, runBlockingOperate, .{operation});
+                return shard.callBlocking(true, blockingOperateOnThreaded, .{operation});
             }
             const src = firstWriteSlice(o.header, o.data, o.splat) orelse return .{ .file_write_streaming = 0 };
             var sync_bytes: win32.DWORD = 0;
@@ -591,25 +574,20 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                 &sync_bytes,
                 &comp.overlapped,
             );
-            if (ok.toBool()) {
-                if (self.poller.hasSkipOnSuccess(o.file.handle)) {
-                    return .{ .file_write_streaming = sync_bytes };
-                }
-            } else {
-                const err = @backingInt(windows.GetLastError());
-                if (err != win32.ERROR_IO_PENDING) {
-                    return .{ .file_write_streaming = mapFileWriteError(err) };
-                }
+            switch (self.classifyWin32Launch(o.file.handle, ok)) {
+                .sync_done => return .{ .file_write_streaming = sync_bytes },
+                .win32_err => |err| return .{ .file_write_streaming = mapFileWriteError(err) },
+                .pending => {},
             }
             self.poller.recordPending(&comp);
-            const res = try self.awaitPending(shard, o.file.handle, &comp, null);
+            const res = try awaitPending(shard, o.file.handle, &comp, null);
             if (res.nt_status != .SUCCESS) {
                 return .{ .file_write_streaming = mapFileWriteError(Iocp.ntStatusToWin32Error(res.nt_status)) };
             }
             return .{ .file_write_streaming = res.bytes };
         },
         .device_io_control => {
-            return shard.callBlocking(true, runBlockingOperate, .{operation});
+            return shard.callBlocking(true, blockingOperateOnThreaded, .{operation});
         },
         .net_read => |o| {
             var bufs: [Threaded.max_iovecs_len]win32.WSABUF = undefined;
@@ -632,19 +610,17 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                 var sync_bytes: win32.DWORD = 0;
                 var comp: Iocp.Completion = .{ .callback = undefined };
                 const rc = recv_msg(sock, &wmsg, &sync_bytes, &comp.overlapped, null);
-                const final_bytes: u32 = if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle))
-                    sync_bytes
-                else blk: {
-                    if (rc == win32.SOCKET_ERROR) {
-                        const werr = win32.WSAGetLastError();
-                        if (werr != win32.WSA_IO_PENDING) return .{ .net_read = mapNetReadError(werr) };
-                    }
-                    self.poller.recordPending(&comp);
-                    const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
-                    if (res.nt_status != .SUCCESS) {
-                        return .{ .net_read = mapNetReadError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
-                    }
-                    break :blk res.bytes;
+                const final_bytes: u32 = switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                    .sync_done => sync_bytes,
+                    .wsa_err => |werr| return .{ .net_read = mapNetReadError(werr) },
+                    .pending => blk: {
+                        self.poller.recordPending(&comp);
+                        const res = try awaitPending(shard, o.socket_handle, &comp, null);
+                        if (res.nt_status != .SUCCESS) {
+                            return .{ .net_read = mapNetReadError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
+                        }
+                        break :blk res.bytes;
+                    },
                 };
                 return .{ .net_read = .{
                     .data_len = final_bytes,
@@ -656,18 +632,13 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             var sync_bytes: win32.DWORD = 0;
             var comp: Iocp.Completion = .{ .callback = undefined };
             const rc = win32.WSARecv(sock, &bufs, n_bufs, &sync_bytes, &flags, &comp.overlapped, null);
-            if (rc == 0) {
-                if (self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                    return .{ .net_read = .{ .data_len = sync_bytes } };
-                }
-            } else {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
-                    return .{ .net_read = mapNetReadError(werr) };
-                }
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => return .{ .net_read = .{ .data_len = sync_bytes } },
+                .wsa_err => |werr| return .{ .net_read = mapNetReadError(werr) },
+                .pending => {},
             }
             self.poller.recordPending(&comp);
-            const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
+            const res = try awaitPending(shard, o.socket_handle, &comp, null);
             if (res.nt_status != .SUCCESS) {
                 return .{ .net_read = mapNetReadError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
             }
@@ -679,8 +650,11 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             const n_bufs = fillWriteWsabufs(&bufs, &splat_buf, o.header, o.data, o.splat);
             if (n_bufs == 0 and o.control.len == 0) return .{ .net_write = 0 };
             const sock = win32.handleToSocket(o.socket_handle);
-            if (o.control.len > 0) {
-                var wmsg: win32.WSAMSG = .{
+            var sync_bytes: win32.DWORD = 0;
+            var comp: Iocp.Completion = .{ .callback = undefined };
+            var wmsg: win32.WSAMSG = undefined;
+            const rc = if (o.control.len > 0) blk: {
+                wmsg = .{
                     .name = null,
                     .namelen = 0,
                     .lpBuffers = &bufs,
@@ -691,38 +665,16 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                     },
                     .dwFlags = 0,
                 };
-                var sync_bytes: win32.DWORD = 0;
-                var comp: Iocp.Completion = .{ .callback = undefined };
-                const rc = win32.WSASendMsg(sock, &wmsg, 0, &sync_bytes, &comp.overlapped, null);
-                if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                    return .{ .net_write = sync_bytes };
-                }
-                if (rc == win32.SOCKET_ERROR) {
-                    const werr = win32.WSAGetLastError();
-                    if (werr != win32.WSA_IO_PENDING) return .{ .net_write = mapNetWriteError(werr) };
-                }
-                self.poller.recordPending(&comp);
-                const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
-                if (res.nt_status != .SUCCESS) {
-                    return .{ .net_write = mapNetWriteError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
-                }
-                return .{ .net_write = res.bytes };
-            }
-            var sync_bytes: win32.DWORD = 0;
-            var comp: Iocp.Completion = .{ .callback = undefined };
-            const rc = win32.WSASend(sock, &bufs, n_bufs, &sync_bytes, 0, &comp.overlapped, null);
-            if (rc == 0) {
-                if (self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                    return .{ .net_write = sync_bytes };
-                }
-            } else {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
-                    return .{ .net_write = mapNetWriteError(werr) };
-                }
+                break :blk win32.WSASendMsg(sock, &wmsg, 0, &sync_bytes, &comp.overlapped, null);
+            } else win32.WSASend(sock, &bufs, n_bufs, &sync_bytes, 0, &comp.overlapped, null);
+
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => return .{ .net_write = sync_bytes },
+                .wsa_err => |werr| return .{ .net_write = mapNetWriteError(werr) },
+                .pending => {},
             }
             self.poller.recordPending(&comp);
-            const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
+            const res = try awaitPending(shard, o.socket_handle, &comp, null);
             if (res.nt_status != .SUCCESS) {
                 return .{ .net_write = mapNetWriteError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))) };
             }
@@ -743,21 +695,17 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             var sync_bytes: win32.DWORD = 0;
             var comp: Iocp.Completion = .{ .callback = undefined };
             const rc = win32.WSARecvFrom(sock, &wbuf, 1, &sync_bytes, &flags, &peer.any, &peer_len, &comp.overlapped, null);
-            const final_bytes: u32 = if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle))
-                sync_bytes
-            else blk: {
-                if (rc == win32.SOCKET_ERROR) {
-                    const werr = win32.WSAGetLastError();
-                    if (werr != win32.WSA_IO_PENDING) {
-                        return .{ .net_receive = .{ mapNetRecvError(werr), 0 } };
+            const final_bytes: u32 = switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => sync_bytes,
+                .wsa_err => |werr| return .{ .net_receive = .{ mapNetRecvError(werr), 0 } },
+                .pending => blk: {
+                    self.poller.recordPending(&comp);
+                    const res = try awaitPending(shard, o.socket_handle, &comp, null);
+                    if (res.nt_status != .SUCCESS) {
+                        return .{ .net_receive = .{ mapNetRecvError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))), 0 } };
                     }
-                }
-                self.poller.recordPending(&comp);
-                const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
-                if (res.nt_status != .SUCCESS) {
-                    return .{ .net_receive = .{ mapNetRecvError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))), 0 } };
-                }
-                break :blk res.bytes;
+                    break :blk res.bytes;
+                },
             };
             const out_msg = &o.message_buffer[0];
             out_msg.from = if (peer_len > 0) Threaded.addressFromPosix(&peer) else .{ .ip4 = .loopback(0) };
@@ -779,9 +727,11 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
             if (o.flags.dont_route) flags |= win32.ws2_32.MSG.DONTROUTE;
             if (o.flags.oob) flags |= win32.ws2_32.MSG.OOB;
 
-            const skip_ok = self.poller.hasSkipOnSuccess(o.socket_handle);
             var sent_count: usize = 0;
             while (sent_count < o.messages.len) {
+                if (sent_count > 0 and shard.current_task.shouldCancelNow()) {
+                    break;
+                }
                 const m = &o.messages[sent_count];
                 var dest: Threaded.PosixAddress = undefined;
                 const dest_len = Threaded.addressToPosix(m.address, &dest);
@@ -792,19 +742,25 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
                 var sync_bytes: win32.DWORD = 0;
                 var comp: Iocp.Completion = .{ .callback = undefined };
                 const rc = win32.WSASendTo(sock, &wbuf, 1, &sync_bytes, flags, &dest.any, @intCast(dest_len), &comp.overlapped, null);
-                if (rc == 0 and skip_ok) {
-                    m.data_len = sync_bytes;
-                    sent_count += 1;
-                    continue;
-                }
-                if (rc == win32.SOCKET_ERROR) {
-                    const werr = win32.WSAGetLastError();
-                    if (werr != win32.WSA_IO_PENDING) {
-                        return .{ .net_send = .{ mapNetSendError(werr), sent_count } };
-                    }
+                switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                    .sync_done => {
+                        m.data_len = sync_bytes;
+                        sent_count += 1;
+                        continue;
+                    },
+                    .wsa_err => |werr| return .{ .net_send = .{ mapNetSendError(werr), sent_count } },
+                    .pending => {},
                 }
                 self.poller.recordPending(&comp);
-                const res = try self.awaitPending(shard, o.socket_handle, &comp, null);
+                const res = awaitPending(shard, o.socket_handle, &comp, null) catch |err| switch (err) {
+                    error.Canceled => {
+                        if (sent_count > 0) {
+                            shard.current_task.recancel();
+                            return .{ .net_send = .{ null, sent_count } };
+                        }
+                        return error.Canceled;
+                    },
+                };
                 if (res.nt_status != .SUCCESS) {
                     return .{ .net_send = .{ mapNetSendError(@intCast(Iocp.ntStatusToWin32Error(res.nt_status))), sent_count } };
                 }
@@ -816,31 +772,9 @@ pub fn operate(self: *WindowsIo, shard: anytype, operation: Io.Operation) Io.Can
     }
 }
 
-// ── Bounded `Io.Batch` Engine (with Sync Skip-On-Success Fast Path) ─────────
+// ── `Io.Batch` Engine (with Sync Skip-On-Success Fast Path) ─────────────────
 
-fn acquireBatchOp(self: *WindowsIo) Allocator.Error!*BatchOp {
-    if (self.batch_op_free) |op| {
-        self.batch_op_free = op.free_next;
-        self.cached_batch_ops -= 1;
-        op.* = .{};
-        return op;
-    }
-    const op = try self.gpa.create(BatchOp);
-    op.* = .{};
-    return op;
-}
-
-fn releaseBatchOp(self: *WindowsIo, op: *BatchOp) void {
-    if (self.cached_batch_ops < max_cached_batch_ops) {
-        op.* = .{ .free_next = self.batch_op_free };
-        self.batch_op_free = op;
-        self.cached_batch_ops += 1;
-    } else {
-        self.gpa.destroy(op);
-    }
-}
-
-fn batchAppendCompleted(batch: *Io.Batch, idx: u32, res: Io.Operation.Result) void {
+pub fn batchAppendCompleted(batch: *Io.Batch, idx: u32, res: Io.Operation.Result) void {
     const oi = Io.Operation.OptionalIndex.fromIndex(idx);
     switch (batch.completed.tail) {
         .none => batch.completed.head = oi,
@@ -880,7 +814,7 @@ fn batchRemovePending(self: *WindowsIo, batch: *Io.Batch, idx: u32) void {
     }
 }
 
-fn batchReturnUnused(batch: *Io.Batch, idx: u32) void {
+pub fn batchReturnUnused(batch: *Io.Batch, idx: u32) void {
     const oi = Io.Operation.OptionalIndex.fromIndex(idx);
     const tail = batch.unused.tail;
     switch (tail) {
@@ -891,26 +825,36 @@ fn batchReturnUnused(batch: *Io.Batch, idx: u32) void {
     batch.unused.tail = oi;
 }
 
+fn batchAppendSubmitted(batch: *Io.Batch, idx: u32, op: Io.Operation) void {
+    const oi = Io.Operation.OptionalIndex.fromIndex(idx);
+    switch (batch.submitted.tail) {
+        .none => batch.submitted.head = oi,
+        else => |tail_oi| batch.storage[tail_oi.toIndex()].submission.node.next = oi,
+    }
+    batch.storage[idx] = .{ .submission = .{ .node = .{ .next = .none }, .operation = op } };
+    batch.submitted.tail = oi;
+}
+
 inline fn wakeBatchAwaiter(self: *WindowsIo, batch: *Io.Batch) void {
     if (batch.userdata) |raw_task| {
         self.wake_task_fn(self.owner_ctx, raw_task);
     }
 }
 
+/// A performed operation surfaces through `completed`; one withdrawn before running goes
+/// back to `submitted` for the next await (or for `Batch.cancel` to discard).
 fn finishBatchOp(bop: *BatchOp) void {
     const self = bop.driver;
     const batch = bop.batch;
     const idx = bop.slot_index;
-    const maybe_res = bop.result;
-    const was_canceled = bop.canceled;
 
     self.batchRemovePending(batch, idx);
-    if (!was_canceled and maybe_res != null) {
-        batchAppendCompleted(batch, idx, maybe_res.?);
+    if (bop.result) |res| {
+        batchAppendCompleted(batch, idx, res);
     } else {
-        batchReturnUnused(batch, idx);
+        batchAppendSubmitted(batch, idx, bop.op);
     }
-    self.releaseBatchOp(bop);
+    self.gpa.destroy(bop);
     self.wakeBatchAwaiter(batch);
 }
 
@@ -930,8 +874,12 @@ fn translateCompletedBatchResult(bop: *BatchOp, status: windows.NTSTATUS, bytes:
         .file_write_streaming => .{
             .file_write_streaming = if (!ok) mapFileWriteError(dos_err) else bytes,
         },
-        .net_read => .{
-            .net_read = if (!ok) mapNetReadError(@intCast(dos_err)) else .{ .data_len = bytes },
+        .net_read => |o| .{
+            .net_read = if (!ok) mapNetReadError(@intCast(dos_err)) else .{
+                .data_len = bytes,
+                .control_len = if (o.control.len > 0) @intCast(bop.backend.iocp.wmsg.Control.len) else 0,
+                .control_truncated = if (o.control.len > 0) (bop.backend.iocp.wmsg.dwFlags & win32.ws2_32.MSG.CTRUNC) != 0 else false,
+            },
         },
         .net_write => .{
             .net_write = if (!ok) mapNetWriteError(@intCast(dos_err)) else bytes,
@@ -965,34 +913,38 @@ fn translateCompletedBatchResult(bop: *BatchOp, status: windows.NTSTATUS, bytes:
 
 fn onBatchIocpComplete(comp: *Iocp.Completion) void {
     const bop: *BatchOp = @ptrCast(@alignCast(comp.ctx.?));
-    if (!bop.canceled) {
+    // Only an abort caused by our own `CancelIoEx` means "never ran"; any other outcome of a
+    // withdrawn operation already took effect in the kernel and must be reported.
+    if (!(bop.withdrawn and comp.nt_status == .CANCELLED)) {
         bop.result = translateCompletedBatchResult(bop, comp.nt_status, comp.bytes_transferred);
     }
     finishBatchOp(bop);
 }
 
-fn onBatchBlockingExec(job: *BlockingPool.Job, threaded: *Threaded) void {
-    const bop: *BatchOp = @ptrCast(@alignCast(job.notify_ctx.?));
-    bop.result = blockingOperateOnThreaded(threaded, bop.op);
+inline fn batchOpFromJob(job: *BlockingPool.Job) *BatchOp {
+    const backend_ptr: *@FieldType(BatchOp, "backend") = @alignCast(@fieldParentPtr("blocking", job));
+    return @fieldParentPtr("backend", backend_ptr);
 }
 
-fn onBatchBlockingNotify(ctx: ?*anyopaque) void {
-    const bop: *BatchOp = @ptrCast(@alignCast(ctx.?));
-    bop.driver.notifyFromAnyThread();
+fn onBatchBlockingExec(job: *BlockingPool.Job, threaded: *Threaded) void {
+    const bop = batchOpFromJob(job);
+    bop.result = blockingOperateOnThreaded(threaded, bop.op) catch |err| switch (err) {
+        error.Canceled => unreachable,
+    };
 }
 
 fn onBatchBlockingResume(node: *ResumeLane.Node) void {
-    const bop: *BatchOp = @ptrCast(@alignCast(node.ctx.?));
-    finishBatchOp(bop);
+    const job: *BlockingPool.Job = @fieldParentPtr("resume_node", node);
+    finishBatchOp(batchOpFromJob(job));
 }
 
 fn submitBatchOpBlocking(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void {
     bop.backend = .{ .blocking = .{
         .run_fn = onBatchBlockingExec,
         .resume_lane = self.resume_lane,
-        .resume_node = .{ .ctx = bop, .callback = onBatchBlockingResume },
-        .notify_ctx = bop,
-        .notify_fn = onBatchBlockingNotify,
+        .resume_node = .{ .callback = onBatchBlockingResume },
+        .notify_ctx = self,
+        .notify_fn = notifyOpaque,
     } };
     switch (self.blocking_pool.submit(&bop.backend.blocking)) {
         .accepted => {},
@@ -1018,21 +970,17 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
             } };
             var sync_bytes: win32.DWORD = 0;
             const ok = win32.ReadFile(o.file.handle, dest.ptr, @intCast(@min(dest.len, std.math.maxInt(u32))), &sync_bytes, &bop.backend.iocp.comp.overlapped);
-            if (ok.toBool()) {
-                if (self.poller.hasSkipOnSuccess(o.file.handle)) {
+            switch (self.classifyWin32Launch(o.file.handle, ok)) {
+                .sync_done => {
                     bop.result = .{ .file_read_streaming = if (sync_bytes == 0) error.EndOfStream else sync_bytes };
                     finishBatchOp(bop);
-                    return;
-                }
-            } else {
-                const err = @backingInt(windows.GetLastError());
-                if (err != win32.ERROR_IO_PENDING) {
+                },
+                .win32_err => |err| {
                     bop.result = .{ .file_read_streaming = mapFileReadError(err) };
                     finishBatchOp(bop);
-                    return;
-                }
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
         .file_write_streaming => |o| {
             if (!o.file.flags.nonblocking) return self.submitBatchOpBlocking(bop);
@@ -1047,21 +995,17 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
             } };
             var sync_bytes: win32.DWORD = 0;
             const ok = win32.WriteFile(o.file.handle, src.ptr, @intCast(@min(src.len, std.math.maxInt(u32))), &sync_bytes, &bop.backend.iocp.comp.overlapped);
-            if (ok.toBool()) {
-                if (self.poller.hasSkipOnSuccess(o.file.handle)) {
+            switch (self.classifyWin32Launch(o.file.handle, ok)) {
+                .sync_done => {
                     bop.result = .{ .file_write_streaming = sync_bytes };
                     finishBatchOp(bop);
-                    return;
-                }
-            } else {
-                const err = @backingInt(windows.GetLastError());
-                if (err != win32.ERROR_IO_PENDING) {
+                },
+                .win32_err => |err| {
                     bop.result = .{ .file_write_streaming = mapFileWriteError(err) };
                     finishBatchOp(bop);
-                    return;
-                }
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
         .net_read => |o| {
             bop.backend = .{ .iocp = .{
@@ -1069,28 +1013,44 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
                 .comp = .{ .ctx = bop, .callback = onBatchIocpComplete },
             } };
             const n_bufs = fillReadWsabufs(&bop.backend.iocp.wsabufs, o.data);
-            if (n_bufs == 0) {
+            if (n_bufs == 0 and o.control.len == 0) {
                 bop.result = .{ .net_read = .{ .data_len = 0 } };
                 finishBatchOp(bop);
                 return;
             }
             const sock = win32.handleToSocket(o.socket_handle);
             var sync_bytes: win32.DWORD = 0;
-            const rc = win32.WSARecv(sock, &bop.backend.iocp.wsabufs, n_bufs, &sync_bytes, &bop.backend.iocp.dw_flags, &bop.backend.iocp.comp.overlapped, null);
-            if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                bop.result = .{ .net_read = .{ .data_len = sync_bytes } };
-                finishBatchOp(bop);
-                return;
-            }
-            if (rc == win32.SOCKET_ERROR) {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
-                    bop.result = .{ .net_read = mapNetReadError(werr) };
+            const rc = if (o.control.len > 0) blk: {
+                const recv_msg = Iocp.resolveExtension(win32.LPFN_WSARECVMSG, sock, win32.WSAID_WSARECVMSG) catch {
+                    bop.result = .{ .net_read = error.Unexpected };
                     finishBatchOp(bop);
                     return;
-                }
+                };
+                bop.backend.iocp.wmsg = .{
+                    .name = null,
+                    .namelen = 0,
+                    .lpBuffers = &bop.backend.iocp.wsabufs,
+                    .dwBufferCount = n_bufs,
+                    .Control = .{
+                        .len = @intCast(@min(o.control.len, std.math.maxInt(u32))),
+                        .buf = o.control.ptr,
+                    },
+                    .dwFlags = 0,
+                };
+                break :blk recv_msg(sock, &bop.backend.iocp.wmsg, &sync_bytes, &bop.backend.iocp.comp.overlapped, null);
+            } else win32.WSARecv(sock, &bop.backend.iocp.wsabufs, n_bufs, &sync_bytes, &bop.backend.iocp.dw_flags, &bop.backend.iocp.comp.overlapped, null);
+
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => {
+                    bop.result = translateCompletedBatchResult(bop, .SUCCESS, sync_bytes);
+                    finishBatchOp(bop);
+                },
+                .wsa_err => |werr| {
+                    bop.result = .{ .net_read = mapNetReadError(werr) };
+                    finishBatchOp(bop);
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
         .net_write => |o| {
             bop.backend = .{ .iocp = .{
@@ -1098,28 +1058,39 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
                 .comp = .{ .ctx = bop, .callback = onBatchIocpComplete },
             } };
             const n_bufs = fillWriteWsabufs(&bop.backend.iocp.wsabufs, &bop.backend.iocp.splat_buf, o.header, o.data, o.splat);
-            if (n_bufs == 0) {
+            if (n_bufs == 0 and o.control.len == 0) {
                 bop.result = .{ .net_write = 0 };
                 finishBatchOp(bop);
                 return;
             }
             const sock = win32.handleToSocket(o.socket_handle);
             var sync_bytes: win32.DWORD = 0;
-            const rc = win32.WSASend(sock, &bop.backend.iocp.wsabufs, n_bufs, &sync_bytes, 0, &bop.backend.iocp.comp.overlapped, null);
-            if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                bop.result = .{ .net_write = sync_bytes };
-                finishBatchOp(bop);
-                return;
-            }
-            if (rc == win32.SOCKET_ERROR) {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
+            const rc = if (o.control.len > 0) blk: {
+                bop.backend.iocp.wmsg = .{
+                    .name = null,
+                    .namelen = 0,
+                    .lpBuffers = &bop.backend.iocp.wsabufs,
+                    .dwBufferCount = n_bufs,
+                    .Control = .{
+                        .len = @intCast(@min(o.control.len, std.math.maxInt(u32))),
+                        .buf = @constCast(o.control.ptr),
+                    },
+                    .dwFlags = 0,
+                };
+                break :blk win32.WSASendMsg(sock, &bop.backend.iocp.wmsg, 0, &sync_bytes, &bop.backend.iocp.comp.overlapped, null);
+            } else win32.WSASend(sock, &bop.backend.iocp.wsabufs, n_bufs, &sync_bytes, 0, &bop.backend.iocp.comp.overlapped, null);
+
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => {
+                    bop.result = .{ .net_write = sync_bytes };
+                    finishBatchOp(bop);
+                },
+                .wsa_err => |werr| {
                     bop.result = .{ .net_write = mapNetWriteError(werr) };
                     finishBatchOp(bop);
-                    return;
-                }
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
         .net_receive => |o| {
             if (o.message_buffer.len == 0) {
@@ -1137,20 +1108,17 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
             const sock = win32.handleToSocket(o.socket_handle);
             var sync_bytes: win32.DWORD = 0;
             const rc = win32.WSARecvFrom(sock, &bop.backend.iocp.wsabufs, 1, &sync_bytes, &bop.backend.iocp.dw_flags, &bop.backend.iocp.from_addr.any, &bop.backend.iocp.from_len, &bop.backend.iocp.comp.overlapped, null);
-            if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                bop.result = translateCompletedBatchResult(bop, .SUCCESS, sync_bytes);
-                finishBatchOp(bop);
-                return;
-            }
-            if (rc == win32.SOCKET_ERROR) {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => {
+                    bop.result = translateCompletedBatchResult(bop, .SUCCESS, sync_bytes);
+                    finishBatchOp(bop);
+                },
+                .wsa_err => |werr| {
                     bop.result = .{ .net_receive = .{ mapNetRecvError(werr), 0 } };
                     finishBatchOp(bop);
-                    return;
-                }
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
         .net_send => |o| {
             if (o.messages.len == 0) {
@@ -1171,21 +1139,18 @@ fn submitSingleBatchOp(self: *WindowsIo, bop: *BatchOp) Io.ConcurrentError!void 
             const sock = win32.handleToSocket(o.socket_handle);
             var sync_bytes: win32.DWORD = 0;
             const rc = win32.WSASendTo(sock, &bop.backend.iocp.wsabufs, 1, &sync_bytes, send_flags, &bop.backend.iocp.from_addr.any, @intCast(dest_len), &bop.backend.iocp.comp.overlapped, null);
-            if (rc == 0 and self.poller.hasSkipOnSuccess(o.socket_handle)) {
-                m.data_len = sync_bytes;
-                bop.result = .{ .net_send = .{ null, 1 } };
-                finishBatchOp(bop);
-                return;
-            }
-            if (rc == win32.SOCKET_ERROR) {
-                const werr = win32.WSAGetLastError();
-                if (werr != win32.WSA_IO_PENDING) {
+            switch (self.classifyWinsockLaunch(o.socket_handle, rc)) {
+                .sync_done => {
+                    m.data_len = sync_bytes;
+                    bop.result = .{ .net_send = .{ null, 1 } };
+                    finishBatchOp(bop);
+                },
+                .wsa_err => |werr| {
                     bop.result = .{ .net_send = .{ mapNetSendError(werr), 0 } };
                     finishBatchOp(bop);
-                    return;
-                }
+                },
+                .pending => self.poller.recordPending(&bop.backend.iocp.comp),
             }
-            self.poller.recordPending(&bop.backend.iocp.comp);
         },
     }
 }
@@ -1204,7 +1169,7 @@ pub fn submitBatch(self: *WindowsIo, batch: *Io.Batch) Io.ConcurrentError!void {
         const op = saved_sub.operation;
         const next_oi = saved_sub.node.next;
 
-        const bop = self.acquireBatchOp() catch return error.ConcurrencyUnavailable;
+        const bop = self.gpa.create(BatchOp) catch return error.ConcurrencyUnavailable;
         bop.* = .{
             .driver = self,
             .batch = batch,
@@ -1216,7 +1181,7 @@ pub fn submitBatch(self: *WindowsIo, batch: *Io.Batch) Io.ConcurrentError!void {
         self.submitSingleBatchOp(bop) catch {
             self.batchRemovePending(batch, idx);
             batch.storage[idx] = .{ .submission = saved_sub };
-            self.releaseBatchOp(bop);
+            self.gpa.destroy(bop);
             return error.ConcurrencyUnavailable;
         };
         cur_oi = next_oi;
@@ -1224,26 +1189,26 @@ pub fn submitBatch(self: *WindowsIo, batch: *Io.Batch) Io.ConcurrentError!void {
     batch.submitted = .empty;
 }
 
-pub fn cancelBatchPending(self: *WindowsIo, batch: *Io.Batch) void {
+/// Requests withdrawal of every pending operation: queued `BlockingPool` jobs return to
+/// `batch.submitted` at once, in-flight `OVERLAPPED`s get `CancelIoEx` and return there (or to
+/// `completed`) when their packet is reaped, and running jobs stay pending until delivered.
+pub fn withdrawBatchPending(self: *WindowsIo, batch: *Io.Batch) void {
     var cur_oi = batch.pending.head;
     while (cur_oi != .none) {
         const idx = cur_oi.toIndex();
-        const next_oi = batch.storage[idx].pending.node.next;
+        cur_oi = batch.storage[idx].pending.node.next;
         const bop: *BatchOp = @ptrFromInt(batch.storage[idx].pending.userdata[0]);
-        bop.canceled = true;
+        bop.withdrawn = true;
 
         switch (bop.backend) {
-            .none => {},
-            .iocp => |*io_st| {
-                Iocp.requestCancelIo(io_st.handle, &io_st.comp);
-            },
+            .none => unreachable,
+            .iocp => |*io_st| Iocp.requestCancelIo(io_st.handle, &io_st.comp),
             .blocking => |*job| {
                 if (self.blocking_pool.tryCancel(job) == .canceled_queued) {
                     finishBatchOp(bop);
                 }
             },
         }
-        cur_oi = next_oi;
     }
 }
 
@@ -1260,15 +1225,37 @@ inline fn openOverlappedSocket(family: c_int, mode: u32, protocol: u32) win32.SO
     );
 }
 
+fn bindIpSocket(sock: win32.SOCKET, address: *const net.IpAddress) WinsockBindListenError!void {
+    var storage: Threaded.PosixAddress = undefined;
+    const addr_len = Threaded.addressToPosix(address, &storage);
+    if (win32.bind(sock, &storage.any, @intCast(addr_len)) == win32.SOCKET_ERROR) {
+        return mapBindOrListenErr(win32.WSAGetLastError());
+    }
+}
+
+fn querySocketAddress(sock: win32.SOCKET) Io.UnexpectedError!net.Socket {
+    var bound: Threaded.PosixAddress = undefined;
+    var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
+    if (win32.getsockname(sock, &bound.any, &bound_len) == win32.SOCKET_ERROR) {
+        return win32.unexpectedWin32(@intCast(win32.WSAGetLastError()));
+    }
+    return .{
+        .handle = win32.socketToHandle(sock),
+        .address = Threaded.addressFromPosix(&bound),
+    };
+}
+
 pub fn netListenIp(
     self: *WindowsIo,
-    shard: anytype,
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
-    if (options.reuse_address and shard.shard_count > 1) {
+    if (options.reuse_address) {
         if (self.acceptor) |acc| {
-            return acc.openOrJoinListener(self.shard_id, address, options);
+            const shared_sock = try acc.openOrJoinListener(self.shard_id, address, options);
+            const lid = acc.tokenListenerId(acc.isSharedToken(shared_sock.handle).?);
+            self.subscribed_listeners |= (@as(u64, 1) << @intCast(lid));
+            return shared_sock;
         }
     }
     const family = Threaded.posixAddressFamily(address);
@@ -1282,26 +1269,14 @@ pub fn netListenIp(
         return mapBindOrListenErr(win32.WSAGetLastError());
     }
 
-    var storage: Threaded.PosixAddress = undefined;
-    const addr_len = Threaded.addressToPosix(address, &storage);
-    if (win32.bind(sock, &storage.any, @intCast(addr_len)) == win32.SOCKET_ERROR) {
-        return mapBindOrListenErr(win32.WSAGetLastError());
-    }
+    try bindIpSocket(sock, address);
     const backlog: c_int = @intCast(@min(options.kernel_backlog, std.math.maxInt(c_int)));
     if (win32.listen(sock, backlog) == win32.SOCKET_ERROR) {
         return mapBindOrListenErr(win32.WSAGetLastError());
     }
-    var bound: Threaded.PosixAddress = undefined;
-    var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
-    if (win32.getsockname(sock, &bound.any, &bound_len) == win32.SOCKET_ERROR) {
-        return mapBindOrListenErr(win32.WSAGetLastError());
-    }
-    const handle = win32.socketToHandle(sock);
-    try self.poller.associateListenHandle(handle, 0);
-    return .{
-        .handle = handle,
-        .address = Threaded.addressFromPosix(&bound),
-    };
+    const result = try querySocketAddress(sock);
+    try self.poller.associateListenHandle(result.handle, 0);
+    return result;
 }
 
 pub fn netAccept(
@@ -1353,14 +1328,23 @@ pub fn netAccept(
                 win32.WSAEINVAL => error.SocketNotListening,
                 win32.WSAEMFILE => error.ProcessFdQuotaExceeded,
                 win32.WSAENOBUFS => error.SystemResources,
-                else => error.Unexpected,
+                else => win32.unexpectedWin32(@intCast(werr)),
             };
         }
     }
     // `listen_sock` uses `associateListenHandle` (no skip-on-success) so `AcceptEx` always queues to IOCP.
     self.poller.recordPending(&comp);
-    const res = try self.awaitPending(shard, server, &comp, null);
-    if (res.nt_status != .SUCCESS) return error.ConnectionAborted;
+    const res = try awaitPending(shard, server, &comp, null);
+    if (res.nt_status != .SUCCESS) {
+        return switch (Iocp.ntStatusToWin32Error(res.nt_status)) {
+            win32.ERROR_OPERATION_ABORTED,
+            @as(u32, @intCast(win32.WSAENOTSOCK)),
+            @as(u32, @intCast(win32.WSAEINVAL)),
+            => error.SocketNotListening,
+            @as(u32, @intCast(win32.WSAENETDOWN)) => error.NetworkDown,
+            else => error.ConnectionAborted,
+        };
+    }
 
     var listen_copy = listen_sock;
     _ = win32.setsockopt(
@@ -1481,21 +1465,10 @@ pub fn netBindIp(
         }
     }
 
-    var storage: Threaded.PosixAddress = undefined;
-    const addr_len = Threaded.addressToPosix(address, &storage);
-    if (win32.bind(sock, &storage.any, @intCast(addr_len)) == win32.SOCKET_ERROR) {
-        return mapBindOrListenErr(win32.WSAGetLastError());
-    }
-    var bound: Threaded.PosixAddress = undefined;
-    var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
-    if (win32.getsockname(sock, &bound.any, &bound_len) == win32.SOCKET_ERROR) {
-        return mapBindOrListenErr(win32.WSAGetLastError());
-    }
+    try bindIpSocket(sock, address);
+    const result = try querySocketAddress(sock);
     self.poller.associateSocket(self.gpa, sock, 0) catch return error.SystemResources;
-    return .{
-        .handle = win32.socketToHandle(sock),
-        .address = Threaded.addressFromPosix(&bound),
-    };
+    return result;
 }
 
 pub fn netConnectIp(
@@ -1536,21 +1509,16 @@ pub fn netConnectIp(
             if (werr != win32.WSA_IO_PENDING) return mapConnectErr(werr);
         }
         self.poller.recordPending(&comp);
-        const res = try self.awaitPending(shard, handle, &comp, maybe_dl);
+        const res = try awaitPending(shard, handle, &comp, maybe_dl);
         if (res.timed_out) return error.Timeout;
         if (res.nt_status != .SUCCESS) {
+            if (res.oom) return error.SystemResources;
             return mapConnectErr(@intCast(Iocp.ntStatusToWin32Error(res.nt_status)));
         }
     }
 
     _ = win32.setsockopt(sock, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.UPDATE_CONNECT_CONTEXT, null, 0);
-    var bound_st: Threaded.PosixAddress = undefined;
-    var bound_len: c_int = @sizeOf(Threaded.PosixAddress);
-    _ = win32.getsockname(sock, &bound_st.any, &bound_len);
-    return .{
-        .handle = handle,
-        .address = Threaded.addressFromPosix(&bound_st),
-    };
+    return querySocketAddress(sock);
 }
 
 fn fillUnixSockaddr(ua: *const net.UnixAddress, sun: *posix.sockaddr.un) posix.socklen_t {
@@ -1575,8 +1543,27 @@ pub fn netListenUnix(
     errdefer _ = win32.closesocket(sock);
     var sun: posix.sockaddr.un = undefined;
     const addr_len = fillUnixSockaddr(ua, &sun);
-    if (win32.bind(sock, @ptrCast(&sun), @intCast(addr_len)) == win32.SOCKET_ERROR) return error.AddressInUse;
-    if (win32.listen(sock, @intCast(@min(options.kernel_backlog, std.math.maxInt(c_int)))) == win32.SOCKET_ERROR) return error.Unexpected;
+    if (win32.bind(sock, @ptrCast(&sun), @intCast(addr_len)) == win32.SOCKET_ERROR) {
+        return switch (win32.WSAGetLastError()) {
+            win32.WSAEADDRINUSE => error.AddressInUse,
+            win32.WSAEADDRNOTAVAIL, win32.WSAEINVAL => error.AddressUnavailable,
+            win32.WSAEACCES => error.AccessDenied,
+            win32.WSAEAFNOSUPPORT => error.AddressFamilyUnsupported,
+            win32.WSAENOBUFS => error.SystemResources,
+            else => |code| switch (@as(u32, @intCast(code))) {
+                win32.ERROR_FILE_NOT_FOUND, win32.ERROR_PATH_NOT_FOUND => error.FileNotFound,
+                win32.ERROR_ACCESS_DENIED => error.AccessDenied,
+                else => |u| win32.unexpectedWin32(u),
+            },
+        };
+    }
+    if (win32.listen(sock, @intCast(@min(options.kernel_backlog, std.math.maxInt(c_int)))) == win32.SOCKET_ERROR) {
+        return switch (win32.WSAGetLastError()) {
+            win32.WSAEADDRINUSE => error.AddressInUse,
+            win32.WSAENOBUFS => error.SystemResources,
+            else => |code| win32.unexpectedWin32(@intCast(code)),
+        };
+    }
     const handle = win32.socketToHandle(sock);
     try self.poller.associateListenHandle(handle, 0);
     return handle;
@@ -1610,23 +1597,13 @@ pub fn netConnectUnix(
     if (!(ok.toBool() and self.poller.hasSkipOnSuccess(handle))) {
         if (!ok.toBool()) {
             const werr = win32.WSAGetLastError();
-            if (werr != win32.WSA_IO_PENDING) {
-                return switch (werr) {
-                    win32.WSAECONNREFUSED => error.ConnectionRefused,
-                    win32.WSAEACCES => error.AccessDenied,
-                    win32.WSAENOBUFS => error.SystemResources,
-                    else => error.FileNotFound,
-                };
-            }
+            if (werr != win32.WSA_IO_PENDING) return mapUnixConnectErr(@intCast(werr));
         }
         self.poller.recordPending(&comp);
-        const res = try self.awaitPending(shard, handle, &comp, null);
+        const res = try awaitPending(shard, handle, &comp, null);
         if (res.nt_status != .SUCCESS) {
-            return switch (@as(c_int, @intCast(Iocp.ntStatusToWin32Error(res.nt_status)))) {
-                win32.WSAECONNREFUSED => error.ConnectionRefused,
-                win32.WSAEACCES => error.AccessDenied,
-                else => error.FileNotFound,
-            };
+            if (res.oom) return error.SystemResources;
+            return mapUnixConnectErr(Iocp.ntStatusToWin32Error(res.nt_status));
         }
     }
     _ = win32.setsockopt(sock, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.UPDATE_CONNECT_CONTEXT, null, 0);
@@ -1634,28 +1611,15 @@ pub fn netConnectUnix(
 }
 
 pub fn netWriteFile(
-    self: *WindowsIo,
-    shard: anytype,
-    socket_handle: net.Socket.Handle,
-    header: []const u8,
+    _: *WindowsIo,
+    _: anytype,
+    _: net.Socket.Handle,
+    _: []const u8,
     file_reader: *File.Reader,
-    limit: Io.Limit,
+    _: Io.Limit,
 ) net.Stream.Writer.WriteFileError!usize {
     if (file_reader.mode == .failure) return error.ReadFailed;
-    const reader_buffered = file_reader.interface.buffered();
-    const at_eof = if (file_reader.size) |size| (size - file_reader.pos == 0) else false;
-    if (reader_buffered.len >= @backingInt(limit) or (at_eof and (header.len != 0 or reader_buffered.len != 0))) {
-        const op_res = try self.operate(shard, .{ .net_write = .{
-            .socket_handle = socket_handle,
-            .header = header,
-            .data = &.{limit.slice(reader_buffered)},
-            .splat = 1,
-        } });
-        const n = try op_res.net_write;
-        file_reader.interface.toss(n -| header.len);
-        return n;
-    }
-    return if (at_eof) error.EndOfStream else error.Unimplemented;
+    return error.Unimplemented;
 }
 
 pub fn netSocketCreatePair(
@@ -1668,7 +1632,7 @@ pub fn netSocketCreatePair(
         .ip4 => .{ .ip4 = .loopback(0) },
         .ip6 => .{ .ip6 = .loopback(0) },
     };
-    const listen_sock = self.netListenIp(shard, &lo, .{
+    const listen_sock = self.netListenIp(&lo, .{
         .mode = .stream,
         .protocol = options.protocol orelse .tcp,
     }) catch return error.SystemResources;
@@ -1677,13 +1641,19 @@ pub fn netSocketCreatePair(
     const client = self.netConnectIp(shard, &listen_sock.address, .{
         .mode = .stream,
         .protocol = options.protocol,
-    }, null) catch return error.SystemResources;
+    }, null) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.SystemResources,
+    };
     errdefer self.netClose((&client)[0..1]);
 
     const accepted = self.netAccept(shard, listen_sock.handle, .{
         .mode = .stream,
         .protocol = options.protocol,
-    }) catch return error.SystemResources;
+    }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.SystemResources,
+    };
     return .{ client, accepted };
 }
 
@@ -1691,7 +1661,18 @@ pub fn netClose(self: *WindowsIo, sockets: []const net.Socket) void {
     for (sockets) |s| {
         if (self.acceptor) |acc| {
             if (acc.isSharedToken(s.handle)) |tok_idx| {
-                acc.closeToken(tok_idx);
+                if (acc.closeToken(tok_idx)) |lid| {
+                    self.subscribed_listeners &= ~(@as(u64, 1) << @intCast(lid));
+                    self.drainAcceptor();
+                    const q = &self.shared_accepts[lid];
+                    while (q.popFront()) |orphan| {
+                        acc.releaseShardLoad(self.shard_id);
+                        if (orphan.raw_sock != win32.INVALID_SOCKET) {
+                            _ = win32.closesocket(orphan.raw_sock);
+                        }
+                    }
+                    self.wakeAllAcceptWaiters(q);
+                }
                 continue;
             }
         }
@@ -1713,51 +1694,47 @@ pub fn netShutdown(_: *WindowsIo, handle: net.Socket.Handle, how: net.ShutdownHo
             win32.WSAECONNABORTED => error.ConnectionAborted,
             win32.WSAENETDOWN => error.NetworkDown,
             win32.WSAENOBUFS => error.SystemResources,
-            else => error.Unexpected,
+            else => |code| win32.unexpectedWin32(@intCast(code)),
         };
     }
 }
 
-pub fn netInterfaceNameResolve(
-    _: *WindowsIo,
-    shard: anytype,
-    name: *const net.Interface.Name,
-) net.Interface.Name.ResolveError!net.Interface {
-    return shard.callBlocking(true, struct {
-        fn run(t: *Threaded, n: *const net.Interface.Name) net.Interface.Name.ResolveError!net.Interface {
-            const t_io = t.io();
-            return t_io.vtable.netInterfaceNameResolve(t_io.userdata, n);
-        }
-    }.run, .{name});
-}
-
-pub fn netInterfaceName(
-    _: *WindowsIo,
-    shard: anytype,
-    interface: net.Interface,
-) net.Interface.NameError!net.Interface.Name {
-    return shard.callBlocking(true, struct {
-        fn run(t: *Threaded, iface: net.Interface) net.Interface.NameError!net.Interface.Name {
-            const t_io = t.io();
-            return t_io.vtable.netInterfaceName(t_io.userdata, iface);
-        }
-    }.run, .{interface});
-}
-
 // ── Unified Win32 / Winsock Error Translators ───────────────────────────────
+
+fn mapUnixConnectErr(code: u32) net.UnixAddress.ConnectError {
+    return switch (code) {
+        @as(u32, @intCast(win32.WSAECONNREFUSED)), win32.ERROR_CONNECTION_REFUSED => error.ConnectionRefused,
+        win32.ERROR_FILE_NOT_FOUND, win32.ERROR_PATH_NOT_FOUND => error.FileNotFound,
+        @as(u32, @intCast(win32.WSAEACCES)), win32.ERROR_ACCESS_DENIED => error.AccessDenied,
+        @as(u32, @intCast(win32.WSAEMFILE)) => error.ProcessFdQuotaExceeded,
+        @as(u32, @intCast(win32.WSAENOBUFS)), win32.ERROR_NOT_ENOUGH_MEMORY, win32.ERROR_NO_SYSTEM_RESOURCES => error.SystemResources,
+        @as(u32, @intCast(win32.WSAENETDOWN)) => error.NetworkDown,
+        @as(u32, @intCast(win32.WSAEAFNOSUPPORT)), @as(u32, @intCast(win32.WSAEINVAL)) => error.AddressFamilyUnsupported,
+        @as(u32, @intCast(win32.WSAEPROTOTYPE)) => error.SocketModeUnsupported,
+        @as(u32, @intCast(win32.WSAEWOULDBLOCK)) => error.WouldBlock,
+        else => win32.unexpectedWin32(code),
+    };
+}
 
 fn mapFileReadError(code: u32) Io.Operation.FileReadStreaming.Error {
     return switch (code) {
         win32.ERROR_HANDLE_EOF, win32.ERROR_BROKEN_PIPE => error.EndOfStream,
         win32.ERROR_NETNAME_DELETED => error.ConnectionResetByPeer,
-        else => error.InputOutput,
+        win32.ERROR_ACCESS_DENIED => error.AccessDenied,
+        win32.ERROR_INVALID_HANDLE => error.NotOpenForReading,
+        win32.ERROR_NOT_ENOUGH_MEMORY, win32.ERROR_NO_SYSTEM_RESOURCES => error.SystemResources,
+        else => win32.unexpectedWin32(code),
     };
 }
 
 fn mapFileWriteError(code: u32) Io.Operation.FileWriteStreaming.Error {
     return switch (code) {
         win32.ERROR_BROKEN_PIPE => error.BrokenPipe,
-        else => error.InputOutput,
+        win32.ERROR_DISK_FULL => error.NoSpaceLeft,
+        win32.ERROR_ACCESS_DENIED => error.AccessDenied,
+        win32.ERROR_INVALID_HANDLE => error.NotOpenForWriting,
+        win32.ERROR_NOT_ENOUGH_MEMORY, win32.ERROR_NO_SYSTEM_RESOURCES => error.SystemResources,
+        else => win32.unexpectedWin32(code),
     };
 }
 
@@ -1769,7 +1746,7 @@ fn mapNetReadError(code: c_int) Io.Operation.NetRead.Error {
         win32.WSAENETDOWN => error.NetworkDown,
         win32.WSAETIMEDOUT => error.ConnectionTimedOut,
         win32.WSAENOBUFS => error.SystemResources,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }
 
@@ -1785,7 +1762,7 @@ fn mapNetWriteError(code: c_int) Io.Operation.NetWrite.Error {
         win32.WSAETIMEDOUT => error.ConnectionTimedOut,
         win32.WSAEDESTADDRREQ, win32.WSAEINVAL => error.SocketNotBound,
         win32.WSAENOBUFS => error.SystemResources,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }
 
@@ -1797,7 +1774,7 @@ fn mapNetRecvError(code: c_int) net.Socket.ReceiveError {
         win32.WSAENETDOWN => error.NetworkDown,
         win32.WSAETIMEDOUT => error.ConnectionTimedOut,
         win32.WSAENOBUFS => error.SystemResources,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }
 
@@ -1814,7 +1791,7 @@ fn mapNetSendError(code: c_int) net.Socket.SendError {
         win32.WSAEACCES => error.AccessDenied,
         win32.WSAETIMEDOUT => error.ConnectionTimedOut,
         win32.WSAENOBUFS => error.SystemResources,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }
 
@@ -1842,7 +1819,7 @@ fn mapBindOrListenErr(code: c_int) WinsockBindListenError {
         win32.WSAEMFILE => error.ProcessFdQuotaExceeded,
         win32.WSAENOBUFS => error.SystemResources,
         win32.WSAENETDOWN => error.NetworkDown,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }
 
@@ -1859,6 +1836,6 @@ fn mapConnectErr(code: c_int) net.IpAddress.ConnectError {
         win32.WSAEACCES => error.AccessDenied,
         win32.WSAENETDOWN => error.NetworkDown,
         win32.WSAENOBUFS => error.SystemResources,
-        else => error.Unexpected,
+        else => win32.unexpectedWin32(@intCast(code)),
     };
 }

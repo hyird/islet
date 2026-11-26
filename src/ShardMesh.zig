@@ -1,18 +1,12 @@
 //! Directed lock-free SPSC ring mesh connecting all ordered `(from, to)` Shard pairs,
 //! augmented with per-target cache-line isolated active-sender bitmaps and round-robin
-//! drain budgets (adapted from Seastar `smp_message_queue` & Tokio `active_senders`).
+//! drain budgets.
 //!
-//! Design invariants (AGENTS.md §3):
 //! - Dedicated SPSC ring per ordered `(from, to)` Shard pair (`N * (N - 1)` rings).
-//! - Each target Shard owns a cache-line aligned `TargetInbox` with atomic `u64`
-//!   active-sender bitmap words:
-//!   - Producers mark the sender bit via a modifying `.seq_cst` `fetchOr`,
-//!     pairing in modification order with the consumer's `.seq_cst` `swap(0)`.
-//!   - Consumers check `isEmptyForSeqCst` in O(1) (1 local word read for <= 64 Shards)
-//!     instead of scanning `N - 1` remote rings.
-//!   - Consumers drain active rings starting from `rr_cursor` with a bounded per-ring
-//!     `drain_budget` per pass, re-arming bits for any ring that still has items so
-//!     high-rate low-index Shards can never starve higher-index Shards.
+//! - Producers push to the SPSC ring (`.seq_cst`) then mark the sender bit via `.seq_cst`
+//!   `fetchOr`, pairing in total order with the consumer's `.seq_cst` `swap(0)`.
+//! - Consumers check `isEmptyForSeqCst` in O(1) per 64 Shards and drain active rings
+//!   from `rr_cursor` with `drain_budget_per_ring`, re-arming non-empty rings fairly.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -211,11 +205,11 @@ test "ShardMesh active bitmap routes messages, enforces per-ring budget, and rot
 
     var dummy_word: u32 = 0;
     const noopWake = struct {
-        fn w(_: ?*anyopaque, _: *FutexTable.Waiter) void {}
+        fn w(_: *FutexTable.Waiter) void {}
     }.w;
 
-    var w_from0: FutexTable.Waiter = .{ .ptr = &dummy_word, .expected = 0, .owner_ctx = null, .wake_fn = noopWake };
-    var w_from2: FutexTable.Waiter = .{ .ptr = &dummy_word, .expected = 0, .owner_ctx = null, .wake_fn = noopWake };
+    var w_from0: FutexTable.Waiter = .{ .ptr = &dummy_word, .expected = 0, .wake_fn = noopWake };
+    var w_from2: FutexTable.Waiter = .{ .ptr = &dummy_word, .expected = 0, .wake_fn = noopWake };
 
     try std.testing.expect(mesh.isEmptyForSeqCst(1));
 

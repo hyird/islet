@@ -1,14 +1,14 @@
 //! Fixed-topology Shared-Nothing multi-Shard `std.Io` runtime.
 //!
-//! Lifecycle contract (AGENTS.md §2, §3, §4):
+//! Lifecycle contract:
 //! - Fixed homogeneous `shard_count` resolved at `init`; never mutated at runtime.
 //! - Two-phase startup:
 //!   1. `init`: allocates Shards, `epoll`/`IOCP` instances, `ShardMesh`, `FutexTable`,
 //!      `BlockingPool`, and (on Windows) `Acceptor`, with exact `errdefer` rollback.
 //!   2. `start` / `run`: spawns OS threads, barrier-synchronizes readiness across
 //!      all Shards, and runs the user entry function on each Shard's own `std.Io`.
-//! - Ordered teardown: `requestStop` -> Shard tasks finish -> `join` (panics on
-//!   self-join deadlock) -> `Acceptor` & `BlockingPool` & `ShardMesh` cleanup.
+//! - Ordered teardown: `requestStop` -> Shard tasks drain -> `join` (panics on
+//!   self-join deadlock) -> `Acceptor`, `ShardMesh`, and `BlockingPool` cleanup.
 
 const std = @import("std");
 const Io = std.Io;
@@ -79,7 +79,8 @@ stopping: std.atomic.Value(bool) = .init(false),
 barrier_mutex: Io.Mutex = .init,
 barrier_cond: Io.Condition = .init,
 barrier_ready_count: usize = 0,
-barrier_failed: bool = false,
+barrier_aborted: bool = false,
+barrier_attach_err: ?Shard.AttachError = null,
 
 active_runner_ctx: ?*anyopaque = null,
 cleanup_runner_fn: ?*const fn (Allocator, *anyopaque) void = null,
@@ -132,7 +133,6 @@ pub fn init(self: *Runtime, gpa: Allocator, options: InitOptions) InitError!void
     for (self.shards, 0..) |*s, idx| {
         try s.init(gpa, shard_opts, .{
             .shard_id = idx,
-            .shard_count = resolved_count,
             .runtime_ptr = self,
             .blocking_pool = &self.blocking_pool,
             .futex_table = &self.futex_table,
@@ -175,34 +175,29 @@ pub fn requestStop(self: *Runtime) void {
     for (self.shards) |*s| s.requestStop();
 }
 
-const EntryMode = enum {
-    io_only,
-    io_and_index,
-};
-
-fn classifyEntryFn(comptime Fn: type) struct { mode: EntryMode, prefix_params: usize } {
+fn entryPrefixParams(comptime Fn: type) usize {
     const info = @typeInfo(Fn).@"fn";
     if (info.param_types.len == 0 or info.param_types[0].? != Io) {
         @compileError("Runtime entry function must accept `std.Io` as its first parameter");
     }
     if (info.param_types.len >= 2 and info.param_types[1].? == usize) {
-        return .{ .mode = .io_and_index, .prefix_params = 2 };
+        return 2;
     }
-    return .{ .mode = .io_only, .prefix_params = 1 };
+    return 1;
 }
 
-pub fn ExtraArgsTuple(comptime Fn: type) type {
+fn ExtraArgsTuple(comptime Fn: type) type {
     const info = @typeInfo(Fn).@"fn";
-    const meta = comptime classifyEntryFn(Fn);
-    const extra_len = info.param_types.len - meta.prefix_params;
+    const prefix = comptime entryPrefixParams(Fn);
+    const extra_len = info.param_types.len - prefix;
     var types: [extra_len]type = undefined;
     for (0..extra_len) |i| {
-        types[i] = info.param_types[meta.prefix_params + i].?;
+        types[i] = info.param_types[prefix + i].?;
     }
     return @Tuple(&types);
 }
 
-pub fn EntryReturnErrorSet(comptime Fn: type) ?type {
+fn EntryReturnErrorSet(comptime Fn: type) ?type {
     const Ret = @typeInfo(Fn).@"fn".return_type.?;
     return switch (@typeInfo(Ret)) {
         .void => null,
@@ -248,7 +243,7 @@ fn startInternal(
     }
 
     const Fn = @TypeOf(function);
-    const meta = comptime classifyEntryFn(Fn);
+    const prefix_params = comptime entryPrefixParams(Fn);
     const MaybeErr = comptime EntryReturnErrorSet(Fn);
     const Extra = ExtraArgsTuple(Fn);
 
@@ -267,9 +262,10 @@ fn startInternal(
             const shard = &rt.shards[shard_idx];
             const kio = kernelIo();
 
-            shard.attachCurrentThread() catch {
+            shard.attachCurrentThread() catch |err| {
                 rt.barrier_mutex.lockUncancelable(kio);
-                rt.barrier_failed = true;
+                rt.barrier_aborted = true;
+                if (rt.barrier_attach_err == null) rt.barrier_attach_err = err;
                 rt.barrier_ready_count += 1;
                 rt.barrier_mutex.unlock(kio);
                 rt.barrier_cond.broadcast(kio);
@@ -284,19 +280,19 @@ fn startInternal(
                 if (rt.barrier_ready_count == rt.shards.len) {
                     rt.barrier_cond.broadcast(kio);
                 } else {
-                    while (rt.barrier_ready_count < rt.shards.len and !rt.barrier_failed) {
+                    while (rt.barrier_ready_count < rt.shards.len and !rt.barrier_aborted) {
                         rt.barrier_cond.waitUncancelable(kio, &rt.barrier_mutex);
                     }
                 }
-                const abort_startup = rt.barrier_failed;
+                const abort_startup = rt.barrier_aborted;
                 rt.barrier_mutex.unlock(kio);
                 if (abort_startup) return;
             }
 
-            const full_args = switch (meta.mode) {
-                .io_only => .{shard.io()} ++ r.extra,
-                .io_and_index => .{ shard.io(), shard_idx } ++ r.extra,
-            };
+            const full_args = if (prefix_params == 2)
+                .{ shard.io(), shard_idx } ++ r.extra
+            else
+                .{shard.io()} ++ r.extra;
 
             if (MaybeErr != null) {
                 @call(.auto, function, full_args) catch |err| {
@@ -324,7 +320,8 @@ fn startInternal(
     self.cleanup_runner_fn = Runner.cleanup;
     self.state = .running;
     self.barrier_ready_count = 0;
-    self.barrier_failed = false;
+    self.barrier_aborted = false;
+    self.barrier_attach_err = null;
     self.spawned_threads = 0;
 
     const kio = kernelIo();
@@ -334,7 +331,7 @@ fn startInternal(
             .allocator = self.gpa,
         }, Runner.threadMain, .{ runner, idx }) catch |err| {
             self.barrier_mutex.lockUncancelable(kio);
-            self.barrier_failed = true;
+            self.barrier_aborted = true;
             self.barrier_mutex.unlock(kio);
             self.barrier_cond.broadcast(kio);
             self.joinThreadsOnly();
@@ -345,15 +342,15 @@ fn startInternal(
 
     // Wait on caller thread until all Shard threads pass the attach barrier.
     self.barrier_mutex.lockUncancelable(kio);
-    while (self.barrier_ready_count < self.shards.len and !self.barrier_failed) {
+    while (self.barrier_ready_count < self.shards.len and !self.barrier_aborted) {
         self.barrier_cond.waitUncancelable(kio, &self.barrier_mutex);
     }
-    const failed = self.barrier_failed;
+    const attach_err = self.barrier_attach_err;
     self.barrier_mutex.unlock(kio);
 
-    if (failed) {
+    if (attach_err) |err| {
         self.joinThreadsOnly();
-        return error.SystemResources;
+        return err;
     }
 }
 
@@ -385,7 +382,7 @@ pub fn run(
     }
 }
 
-pub fn RunResult(comptime Fn: type) type {
+fn RunResult(comptime Fn: type) type {
     const StartErr = Allocator.Error || Shard.AttachError || std.Thread.SpawnError;
     if (EntryReturnErrorSet(Fn)) |E| {
         return (StartErr || E)!void;

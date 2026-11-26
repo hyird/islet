@@ -1,21 +1,12 @@
-//! Bounded worker thread pool for synchronous/blocking syscall offload.
+//! Bounded worker thread pool for blocking syscall offload.
 //!
-//! Design invariants (AGENTS.md §3, §4, §5):
-//! - Pre-sized worker threads and bounded admission (`queue_capacity` + bounded
-//!   `wait_capacity` intrusive waiter queue); `submit` returns explicit
-//!   `.queue_full` / `.closed` immediately for `Io.Batch.awaitConcurrent`, while
-//!   `submitWaitable` parks Fiber-resident `Job` nodes in FIFO admission order and
-//!   promotes them directly on worker pop/cancel with **zero 1ms polling sleep**
-//!   and **zero extra cross-thread wakeup round-trips**.
-//! - Zero heap allocation per submitted job: intrusive `Job` nodes live on the
-//!   calling Fiber's stack frame.
-//! - Safe cancellation (`tryCancel`):
-//!   - If `.waiting_admission` or `.queued`, unlinks `Job` in O(1) under the mutex
-//!     (promoting the next admission waiter when freeing a queue slot) so worker
-//!     threads never touch the stack frame (`canceled_queued`).
-//!   - If already popped and running on a worker thread, returns `.must_await`
-//!     so the calling Fiber waits uncancelably until completion before unwinding.
-//! - Owns a single shared `std.Io.Threaded` initialized via `.init_single_threaded`.
+//! - Pre-sized worker threads and bounded admission (`queue_capacity`); `submit`
+//!   returns `.queue_full` / `.closed` immediately for `Io.Batch.awaitConcurrent`,
+//!   while `submitWaitable` parks Fiber-resident `Job` nodes in FIFO admission order
+//!   and promotes them in O(1) when a worker slot opens.
+//! - Intrusive `Job` nodes reside on the calling Fiber's stack with zero heap allocs.
+//! - `tryCancel` unlinks `.waiting_admission` / `.queued` jobs in O(1) under the lock,
+//!   or returns `.must_await` when a worker has already popped the job.
 //! - Self-submission or self-`join` from inside a pool worker triggers `@panic`.
 
 const std = @import("std");
@@ -79,8 +70,6 @@ queued_count: usize = 0,
 queue_capacity: usize,
 wait_head: ?*Job = null,
 wait_tail: ?*Job = null,
-waiting_count: usize = 0,
-wait_capacity: usize,
 stopping: bool = false,
 joined: bool = false,
 
@@ -115,7 +104,6 @@ pub fn init(
         .threaded = threaded,
         .threads = threads,
         .queue_capacity = queue_capacity,
-        .wait_capacity = @max(@as(usize, 64), queue_capacity *| 8),
     };
     errdefer self.threaded.deinit();
 
@@ -195,11 +183,11 @@ fn submitInternal(self: *BlockingPool, job: *Job, allow_wait: bool) SubmitStatus
             return .closed;
         }
         if (self.queued_count < self.queue_capacity) {
-            assert(self.waiting_count == 0);
+            assert(self.wait_head == null);
             self.pushQueuedLocked(job);
             should_signal = true;
             self.mutex.unlock(kio);
-        } else if (allow_wait and self.waiting_count < self.wait_capacity) {
+        } else if (allow_wait) {
             self.pushWaiterLocked(job);
             self.mutex.unlock(kio);
         } else {
@@ -236,7 +224,6 @@ fn pushWaiterLocked(self: *BlockingPool, job: *Job) void {
         self.wait_head = job;
     }
     self.wait_tail = job;
-    self.waiting_count += 1;
 }
 
 fn promoteOneWaiterLocked(self: *BlockingPool) bool {
@@ -249,7 +236,6 @@ fn promoteOneWaiterLocked(self: *BlockingPool) bool {
         self.wait_tail = null;
     }
     assert(w.state == .waiting_admission);
-    self.waiting_count -= 1;
     self.pushQueuedLocked(w);
     return true;
 }
@@ -281,7 +267,6 @@ pub fn tryCancel(self: *BlockingPool, job: *Job) CancelOutcome {
                 job.prev = null;
                 job.next = null;
                 job.state = .canceled;
-                self.waiting_count -= 1;
                 break :blk .canceled_queued;
             },
             else => break :blk .must_await,
@@ -376,6 +361,7 @@ test "BlockingPool executes jobs, enforces backpressure, promotes waitable admis
     };
 
     var gate: std.Io.Event = .unset;
+    defer gate.set(kio);
     var w1: Work = .{ .gate = &gate, .job = .{
         .run_fn = Work.exec,
         .resume_lane = &lane,
@@ -431,6 +417,29 @@ test "BlockingPool executes jobs, enforces backpressure, promotes waitable admis
     try std.testing.expectEqual(JobState.queued, w4.job.state);
     // w1 is running: must report `.must_await`.
     try std.testing.expectEqual(CancelOutcome.must_await, pool.tryCancel(&w1.job));
+
+    // Burst 70 Fiber-resident `submitWaitable` jobs (> old 64 `wait_capacity`) must all
+    // park event-driven in FIFO order without falling back to `.queue_full` 1ms polling!
+    var burst: [70]Work = undefined;
+    var queued_burst: usize = 0;
+    defer for (burst[0..queued_burst]) |*bw| {
+        _ = pool.tryCancel(&bw.job);
+    };
+    for (&burst) |*bw| {
+        bw.* = .{ .job = .{
+            .run_fn = Work.exec,
+            .resume_lane = &lane,
+            .resume_node = .{ .callback = Work.onResume },
+            .notify_ctx = &door_rings,
+            .notify_fn = Work.ring,
+        } };
+        try std.testing.expectEqual(SubmitStatus.accepted, pool.submitWaitable(&bw.job));
+        queued_burst += 1;
+    }
+    for (&burst) |*bw| {
+        try std.testing.expectEqual(CancelOutcome.canceled_queued, pool.tryCancel(&bw.job));
+    }
+    queued_burst = 0;
 
     gate.set(kio);
     while (door_rings.load(.seq_cst) < 3) {

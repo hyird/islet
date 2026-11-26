@@ -1,10 +1,9 @@
 //! Cross-thread coalesced wakeup doorbell, bounded external admission `Mailbox`,
-//! and unbounded zero-allocation intrusive `ResumeLane`.
+//! and zero-allocation intrusive `ResumeLane`.
 //!
-//! Lock discipline (AGENTS.md §4):
+//! Lock discipline:
 //! - Internal mutexes ONLY swap indices or splice intrusive pointer chains.
-//! - User callbacks, payload cleanup, and kernel doorbell syscalls ALWAYS run
-//!   outside any mutex.
+//! - Callbacks, payload cleanup, and kernel doorbell syscalls ALWAYS run outside locks.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -47,14 +46,14 @@ inline fn kernelIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-/// Bounded MPSC admission queue using `2 * capacity` preallocated slots (borrowed
-/// from Ruvia's `worker_dispatcher`): while up to `capacity` items are spliced out
-/// and processed outside the mutex by the consumer, up to `capacity` new items can
-/// still be admitted without ever exhausting free nodes or allocating on the heap.
+/// Bounded MPSC admission queue backed by a `2 * capacity` contiguous ping-pong
+/// double buffer: producers admit in O(1) under a single mutex acquisition (with
+/// zero torn window against `close()`), while the consumer swaps the active slice
+/// in O(1) under a single mutex acquisition and invokes `consume_fn` unlocked
+/// while up to `capacity` new items continue to arrive in the alternate buffer.
 pub fn Mailbox(comptime T: type) type {
     return struct {
         const Self = @This();
-        const no_node: u32 = std.math.maxInt(u32);
 
         pub const PostResult = union(enum) {
             accepted,
@@ -62,43 +61,31 @@ pub fn Mailbox(comptime T: type) type {
             closed: T,
         };
 
-        const Node = struct {
-            next: u32 = no_node,
-            payload: T = undefined,
-        };
-
         mutex: std.Io.Mutex = .init,
         published_seq: std.atomic.Value(usize) align(cache_line) = .init(0),
-        nodes: []Node,
+        storage: []T,
         capacity: u32,
-        pending_count: u32 = 0,
-        free_head: u32 = 0,
-        ready_head: u32 = no_node,
-        ready_tail: u32 = no_node,
+        len: u32 = 0,
+        active_half: u1 = 0,
         closed: bool = false,
+        draining: bool = false,
 
         pub fn init(gpa: Allocator, capacity: u32) (Allocator.Error || error{InvalidCapacity})!Self {
             if (capacity == 0 or capacity > std.math.maxInt(u32) / 2) {
                 return error.InvalidCapacity;
             }
-            const total_nodes: usize = @as(usize, capacity) * 2;
-            const nodes = try gpa.alloc(Node, total_nodes);
-            for (nodes, 0..) |*node, i| {
-                node.* = .{
-                    .next = if (i + 1 < total_nodes) @intCast(i + 1) else no_node,
-                };
-            }
+            const storage = try gpa.alloc(T, @as(usize, capacity) * 2);
             return .{
-                .nodes = nodes,
+                .storage = storage,
                 .capacity = capacity,
             };
         }
 
         pub fn deinit(self: *Self, gpa: Allocator, cleanup_fn: ?*const fn (*T) void) void {
             if (cleanup_fn) |cleanup| {
-                self.drainAllWith(cleanup);
+                for (self.takeActiveSlice()) |*item| cleanup(item);
             }
-            gpa.free(self.nodes);
+            gpa.free(self.storage);
             self.* = undefined;
         }
 
@@ -109,44 +96,24 @@ pub fn Mailbox(comptime T: type) type {
             self.mutex.unlock(kio);
         }
 
-        /// Reserves capacity first; on backpressure or closure returns `payload`
-        /// untouched to the caller. Caller should wake the target Shard's
-        /// `Doorbell` after `.accepted` outside any lock.
+        /// Admits `payload` in O(1) under a single lock; on backpressure or closure
+        /// returns `payload` untouched. Caller wakes the target `Doorbell` outside any lock.
         pub fn tryPost(self: *Self, payload: T) PostResult {
             const kio = kernelIo();
-            var index: u32 = no_node;
-            {
-                self.mutex.lockUncancelable(kio);
-                if (self.closed) {
-                    self.mutex.unlock(kio);
-                    return .{ .closed = payload };
-                }
-                if (self.pending_count == self.capacity) {
-                    self.mutex.unlock(kio);
-                    return .{ .queue_full = payload };
-                }
-                index = self.free_head;
-                assert(index != no_node);
-                self.free_head = self.nodes[index].next;
-                self.pending_count += 1;
+            self.mutex.lockUncancelable(kio);
+            if (self.closed) {
                 self.mutex.unlock(kio);
+                return .{ .closed = payload };
             }
-
-            // Copy payload outside the mutex.
-            self.nodes[index].payload = payload;
-            self.nodes[index].next = no_node;
-
-            {
-                self.mutex.lockUncancelable(kio);
-                if (self.ready_tail == no_node) {
-                    self.ready_head = index;
-                } else {
-                    self.nodes[self.ready_tail].next = index;
-                }
-                self.ready_tail = index;
-                _ = self.published_seq.fetchAdd(1, .seq_cst);
+            if (self.len == self.capacity) {
                 self.mutex.unlock(kio);
+                return .{ .queue_full = payload };
             }
+            const base = @as(usize, self.active_half) * self.capacity;
+            self.storage[base + self.len] = payload;
+            self.len += 1;
+            _ = self.published_seq.fetchAdd(1, .seq_cst);
+            self.mutex.unlock(kio);
             return .accepted;
         }
 
@@ -154,76 +121,34 @@ pub fn Mailbox(comptime T: type) type {
             return self.published_seq.load(.seq_cst) == 0;
         }
 
-        /// Splices all ready nodes in O(1) under the mutex, invokes `consume_fn` on
-        /// every payload outside the mutex, and returns the entire physical node
-        /// chain to `free_head` in a single O(1) splice (`2 * capacity` nodes
-        /// guarantee full concurrent admission capacity while draining).
-        pub fn drain(self: *Self, ctx: ?*anyopaque, consume_fn: *const fn (?*anyopaque, T) void) usize {
-            const kio = kernelIo();
-            var batch_head: u32 = no_node;
-            var batch_tail: u32 = no_node;
-            var batch_len: u32 = 0;
-            {
-                self.mutex.lockUncancelable(kio);
-                batch_head = self.ready_head;
-                if (batch_head != no_node) {
-                    batch_tail = self.ready_tail;
-                    self.ready_head = no_node;
-                    self.ready_tail = no_node;
-                    var cur = batch_head;
-                    while (cur != no_node) : (cur = self.nodes[cur].next) {
-                        batch_len += 1;
-                    }
-                    self.pending_count -= batch_len;
-                    _ = self.published_seq.fetchSub(batch_len, .seq_cst);
-                }
-                self.mutex.unlock(kio);
-            }
-            if (batch_head == no_node) return 0;
-            defer self.releaseChain(batch_head, batch_tail);
-
-            var cur = batch_head;
-            while (cur != no_node) {
-                const next = self.nodes[cur].next;
-                const value = self.nodes[cur].payload;
-                consume_fn(ctx, value);
-                cur = next;
-            }
-            return batch_len;
-        }
-
-        fn drainAllWith(self: *Self, cleanup: *const fn (*T) void) void {
-            const kio = kernelIo();
-            var batch_head: u32 = no_node;
-            var batch_tail: u32 = no_node;
-            {
-                self.mutex.lockUncancelable(kio);
-                batch_head = self.ready_head;
-                batch_tail = self.ready_tail;
-                self.ready_head = no_node;
-                self.ready_tail = no_node;
-                self.pending_count = 0;
-                self.published_seq.store(0, .seq_cst);
-                self.mutex.unlock(kio);
-            }
-            if (batch_head == no_node) return;
-            defer self.releaseChain(batch_head, batch_tail);
-
-            var cur = batch_head;
-            while (cur != no_node) {
-                const next = self.nodes[cur].next;
-                var value = self.nodes[cur].payload;
-                cleanup(&value);
-                cur = next;
-            }
-        }
-
-        fn releaseChain(self: *Self, chain_head: u32, chain_tail: u32) void {
+        fn takeActiveSlice(self: *Self) []T {
             const kio = kernelIo();
             self.mutex.lockUncancelable(kio);
-            self.nodes[chain_tail].next = self.free_head;
-            self.free_head = chain_head;
+            const count = self.len;
+            if (count == 0) {
+                self.mutex.unlock(kio);
+                return &.{};
+            }
+            const base = @as(usize, self.active_half) * self.capacity;
+            self.active_half ^= 1;
+            self.len = 0;
+            self.published_seq.store(0, .seq_cst);
             self.mutex.unlock(kio);
+            return self.storage[base .. base + count];
+        }
+
+        /// Swaps out all ready items in O(1) under a single lock and invokes
+        /// `consume_fn` on every payload outside the lock. Single-consumer, non-reentrant.
+        pub fn drain(self: *Self, ctx: ?*anyopaque, consume_fn: *const fn (?*anyopaque, T) void) usize {
+            assert(!self.draining);
+            self.draining = true;
+            defer self.draining = false;
+
+            const batch = self.takeActiveSlice();
+            for (batch) |value| {
+                consume_fn(ctx, value);
+            }
+            return batch.len;
         }
     };
 }
@@ -235,7 +160,6 @@ pub fn Mailbox(comptime T: type) type {
 pub const ResumeLane = struct {
     pub const Node = struct {
         next: ?*Node = null,
-        ctx: ?*anyopaque = null,
         callback: *const fn (*Node) void,
     };
 
@@ -332,6 +256,45 @@ test "Mailbox enforces capacity, returns rejected payload, and runs callbacks un
         .closed => |v| try std.testing.expectEqual(@as(u32, 99), v),
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expect(mbox.isEmptySeqCst());
+
+    // Verify `deinit` cleans up unconsumed items and concurrent `tryPost` vs `close()` loses zero items.
+    var mbox2 = try Mailbox(u32).init(gpa, 8);
+    const State = struct {
+        cleaned: std.atomic.Value(usize) = .init(0),
+        consumed: std.atomic.Value(usize) = .init(0),
+        rejected: std.atomic.Value(usize) = .init(0),
+        var cleaned_ref: *std.atomic.Value(usize) = undefined;
+
+        fn onCleanup(_: *u32) void {
+            _ = cleaned_ref.fetchAdd(1, .monotonic);
+        }
+        fn onDrain(ctx: ?*anyopaque, _: u32) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = s.consumed.fetchAdd(1, .monotonic);
+        }
+        fn producer(m: *Mailbox(u32), s: *@This()) void {
+            for (0..500) |i| {
+                switch (m.tryPost(@intCast(i))) {
+                    .accepted => {},
+                    .queue_full, .closed => _ = s.rejected.fetchAdd(1, .monotonic),
+                }
+            }
+        }
+    };
+    var st: State = .{};
+    State.cleaned_ref = &st.cleaned;
+    const p1 = try std.Thread.spawn(.{}, State.producer, .{ &mbox2, &st });
+    const p2 = try std.Thread.spawn(.{}, State.producer, .{ &mbox2, &st });
+    _ = mbox2.drain(&st, State.onDrain);
+    mbox2.close();
+    p1.join();
+    p2.join();
+    mbox2.deinit(gpa, State.onCleanup);
+    try std.testing.expectEqual(
+        @as(usize, 1000),
+        st.consumed.load(.monotonic) + st.cleaned.load(.monotonic) + st.rejected.load(.monotonic),
+    );
 }
 
 test "ResumeLane and Doorbell coalesce wakeups and execute callbacks outside lock" {

@@ -1,17 +1,13 @@
 //! Linux `epoll` + `eventfd` edge-triggered readiness multiplexer per Shard.
 //!
-//! Design invariants (AGENTS.md §4):
 //! - Exclusive `epoll_fd` and `event_fd` per Shard; zero cross-thread fd sharing.
-//! - Each fd registers `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET` ONCE on first
+//! - Each fd registers `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET` once on first
 //!   `WouldBlock`, avoiding per-operation `EPOLL_CTL_MOD` syscalls.
-//! - Compact 3-word intrusive `Waiter` (`@fieldParentPtr`-friendly, fits inline
-//!   inside `Io.Operation.Storage.Pending.Userdata` with zero heap allocation).
-//! - Pure edge-triggered waiter queues without sticky `HUP`/`ERR` flags: because
-//!   every caller attempts a nonblocking syscall immediately before `waitIo` on
-//!   the same single-threaded Shard, transient socket errors (e.g. UDP ICMP) or
-//!   half-closed streams never degenerate into spin loops.
-//! - `EPERM` from `epoll_ctl` (regular disk files / `/dev/null`) surfaces as
-//!   `error.PollUnsupported` so callers offload to `BlockingPool` transparently.
+//! - Compact 3-word intrusive `Waiter` fits inline inside `Io.Operation.Storage.Pending.Userdata`.
+//! - `unregisterFd` removes the fd from `epoll` and advances its slot `generation`
+//!   before `close(fd)` to prevent descriptor-reuse ABA cross-talk.
+//! - `EPERM` from `epoll_ctl` (regular disk files) surfaces as `error.PollUnsupported`
+//!   so callers offload to `BlockingPool` transparently.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,6 +21,7 @@ const Doorbell = Mailbox.Doorbell;
 const Epoll = @This();
 
 pub const default_max_fds: u32 = 65536;
+pub const max_cached_slots: usize = 1024;
 const eventfd_sentinel: u64 = std.math.maxInt(u64);
 
 pub const Direction = enum(u1) {
@@ -51,7 +48,7 @@ pub const RegisterError = Allocator.Error || error{
 pub const Waiter = struct {
     prev: ?*Waiter = null,
     next: ?*Waiter = null,
-    wake_fn: *const fn (*Waiter) void,
+    wake_fn: *const fn (*Epoll, *Waiter) void,
 };
 
 const WaitQueue = struct {
@@ -104,15 +101,15 @@ const WaitQueue = struct {
         w.next = null;
     }
 
-    fn wakeAll(self: *WaitQueue) void {
+    fn wakeAll(self: *WaitQueue, ep: *Epoll) void {
         while (self.popFront()) |w| {
-            w.wake_fn(w);
+            w.wake_fn(ep, w);
         }
     }
 
-    fn wakeOne(self: *WaitQueue) void {
+    fn wakeOne(self: *WaitQueue, ep: *Epoll) void {
         const w = self.popFront() orelse return;
-        w.wake_fn(w);
+        w.wake_fn(ep, w);
     }
 };
 
@@ -126,6 +123,7 @@ const FdSlot = struct {
 epoll_fd: linux.fd_t,
 event_fd: linux.fd_t,
 max_fds: u32,
+min_generation: u32 = 1,
 doorbell: Doorbell = .init,
 slots: std.ArrayListUnmanaged(FdSlot) = .empty,
 events_buf: [128]linux.epoll_event = undefined,
@@ -213,7 +211,7 @@ pub fn waitIo(
         try self.slots.ensureTotalCapacity(gpa, new_len);
         const old_len = self.slots.items.len;
         self.slots.items.len = new_len;
-        @memset(self.slots.items[old_len..new_len], .{});
+        @memset(self.slots.items[old_len..new_len], .{ .generation = self.min_generation });
     }
 
     const slot = &self.slots.items[ufd];
@@ -268,8 +266,8 @@ pub fn cascadeNext(self: *Epoll, fd: linux.fd_t, dir: Direction) void {
     const slot = &self.slots.items[ufd];
     if (!slot.registered) return;
     switch (dir) {
-        .read => slot.read_waiters.wakeOne(),
-        .write => slot.write_waiters.wakeOne(),
+        .read => slot.read_waiters.wakeOne(self),
+        .write => slot.write_waiters.wakeOne(self),
     }
 }
 
@@ -284,12 +282,25 @@ pub fn unregisterFd(self: *Epoll, fd: linux.fd_t) void {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         slot.registered = false;
         slot.generation +%= 1;
-        if (slot.generation == 0 or slot.generation == std.math.maxInt(u32)) {
-            slot.generation = 1;
+        if (slot.generation < self.min_generation) {
+            slot.generation = self.min_generation;
         }
     }
-    slot.read_waiters.wakeAll();
-    slot.write_waiters.wakeAll();
+    slot.read_waiters.wakeAll(self);
+    slot.write_waiters.wakeAll(self);
+}
+
+/// Reclaims excess fd slot table capacity back to `gpa` when completely idle
+/// and `slots.capacity > max_cached_slots`, advancing `min_generation` for ABA safety.
+pub fn scavengeIdle(self: *Epoll, gpa: Allocator) void {
+    if (self.slots.capacity <= max_cached_slots) return;
+    var max_gen = self.min_generation;
+    for (self.slots.items) |*s| {
+        if (s.registered or s.read_waiters.head != null or s.write_waiters.head != null) return;
+        if (s.generation > max_gen) max_gen = s.generation;
+    }
+    self.min_generation = if (max_gen >= std.math.maxInt(u32) - 1) 1 else max_gen + 1;
+    self.slots.clearAndFree(gpa);
 }
 
 /// Polls `epoll_wait` once with `timeout_ms` (`-1` = infinite, `0` = immediate).
@@ -321,15 +332,15 @@ pub fn poll(self: *Epoll, timeout_ms: i32) usize {
 
         const flags = ev.events;
         if ((flags & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0) {
-            slot.read_waiters.wakeAll();
-            slot.write_waiters.wakeAll();
+            slot.read_waiters.wakeAll(self);
+            slot.write_waiters.wakeAll(self);
             continue;
         }
         if ((flags & (linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.PRI)) != 0) {
-            slot.read_waiters.wakeOne();
+            slot.read_waiters.wakeOne(self);
         }
         if ((flags & linux.EPOLL.OUT) != 0) {
-            slot.write_waiters.wakeOne();
+            slot.write_waiters.wakeOne(self);
         }
     }
     return n;
@@ -380,7 +391,7 @@ test "Epoll wakes on pipe readiness, does not spin after transient socket error,
     const Hook = struct {
         waiter: Waiter,
         woken: bool = false,
-        fn wake(w: *Waiter) void {
+        fn wake(_: *Epoll, w: *Waiter) void {
             const self: *@This() = @fieldParentPtr("waiter", w);
             self.woken = true;
         }
@@ -416,4 +427,14 @@ test "Epoll wakes on pipe readiness, does not spin after transient socket error,
 
     var file_hook: Hook = .{ .waiter = .{ .wake_fn = Hook.wake } };
     try std.testing.expectError(error.PollUnsupported, ep.waitIo(gpa, null_fd, .read, &file_hook.waiter));
+
+    // Verify `scavengeIdle` reclaims capacity above `max_cached_slots` when all fds are unregistered.
+    var ep_scav = try Epoll.init(4096);
+    defer ep_scav.deinit(gpa);
+    try ep_scav.slots.ensureTotalCapacity(gpa, max_cached_slots + 64);
+    ep_scav.slots.items.len = max_cached_slots + 16;
+    @memset(ep_scav.slots.items, .{ .generation = 5 });
+    ep_scav.scavengeIdle(gpa);
+    try std.testing.expectEqual(@as(usize, 0), ep_scav.slots.capacity);
+    try std.testing.expect(ep_scav.min_generation > 5);
 }

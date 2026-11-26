@@ -14,8 +14,7 @@
 const std = @import("std");
 const islet = @import("islet");
 
-fn shardMain(io: std.Io, shard_index: usize) !void {
-    _ = shard_index;
+fn shardMain(io: std.Io) !void {
     try io.sleep(.fromMilliseconds(10), .awake);
 }
 

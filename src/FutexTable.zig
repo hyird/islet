@@ -1,25 +1,18 @@
 //! 256-way cache-line striped Futex wait table powering `std.Io` synchronization
-//! (`Io.Mutex`, `Io.Condition`, `Io.Event`, `Io.RwLock`, `Io.Semaphore`, `Io.Queue`,
-//! `Io.Select`) across Fibers within a Shard and across Shards/threads.
+//! across Fibers within a Shard and across Shards/threads.
 //!
-//! Design invariants & weak-memory (`aarch64` / `x86_64`) modification-order proof:
-//! - Fibonacci-hashed address striping (256 cache-line isolated stripes).
+//! Weak-memory (`aarch64` / `x86_64`) modification-order proof:
 //! - Single-word packed `state: std.atomic.Value(u64)` (`(wake_epoch << 32) | waiters`):
 //!   - `tryPark` executes `state.fetchAdd(1, .seq_cst)` BEFORE locking `stripe.mutex`
 //!     and checking `@atomicLoad(u32, waiter.ptr, .seq_cst)`.
-//!   - `wake` (after caller's `.release` or `.seq_cst` store to `*ptr`) executes a
-//!     real modifying RMW `const prev = state.fetchAdd(1 << 32, .seq_cst)` on the
-//!     **exact same** `state` word and returns in O(1) if `@truncate(u32, prev) == 0`.
-//!   - Because both `tryPark` and `wake` perform `.acq_rel`/`.seq_cst` RMWs in the
-//!     single modification order of `stripe.state`:
-//!     1. If `wake`'s RMW precedes `tryPark`'s RMW, `wake`'s release synchronizes-with
-//!        `tryPark`'s acquire via `stripe.state`'s release sequence, so the caller's
-//!        prior `.release` store to `*ptr` strictly happens-before `tryPark`'s load of
-//!        `*ptr` even on weak-memory ARMv8 (`aarch64`).
-//!     2. If `tryPark`'s RMW precedes `wake`'s RMW, `wake` observes `waiters >= 1`
-//!        in `prev` and enters `stripe.mutex`.
-//! - Stripe mutex ONLY links/unlinks intrusive stack-resident `Waiter` nodes;
-//!   all Shard wakeup callbacks and doorbell syscalls run strictly outside the mutex.
+//!   - `wake` (after caller's `.release`/`.seq_cst` store to `*ptr`) executes a
+//!     modifying RMW `const prev = state.fetchAdd(1 << 32, .seq_cst)` on the same
+//!     `state` word and returns in O(1) if `@truncate(u32, prev) == 0`.
+//!   - If `wake`'s RMW precedes `tryPark`'s RMW, `wake`'s release synchronizes-with
+//!     `tryPark`'s acquire so `*ptr` mutation is visible to `tryPark`; otherwise
+//!     `wake` observes `waiters >= 1` and enters `stripe.mutex`.
+//! - Stripe mutex ONLY links/unlinks stack-resident `Waiter` nodes; all wakeup
+//!   callbacks and doorbell syscalls run outside the mutex.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -41,8 +34,7 @@ pub const Waiter = struct {
     linked: bool = false,
     ptr: *const u32,
     expected: u32,
-    owner_ctx: ?*anyopaque,
-    wake_fn: *const fn (owner_ctx: ?*anyopaque, waiter: *Waiter) void,
+    wake_fn: *const fn (waiter: *Waiter) void,
 };
 
 const Stripe = struct {
@@ -190,7 +182,7 @@ pub fn wake(self: *FutexTable, ptr: *const u32, max_waiters: u32) void {
     while (cur) |w| {
         const next = w.next;
         w.next = null;
-        w.wake_fn(w.owner_ctx, w);
+        w.wake_fn(w);
         cur = next;
     }
 }
@@ -208,8 +200,7 @@ test "FutexTable single-word RMW fast-path mismatch, FIFO partial wake, and unpa
         id: u32,
         waiter: Waiter,
 
-        fn onWake(ctx: ?*anyopaque, w: *Waiter) void {
-            _ = ctx;
+        fn onWake(w: *Waiter) void {
             const self: *@This() = @fieldParentPtr("waiter", w);
             self.st.woken_order[self.st.len] = self.id;
             self.st.len += 1;
@@ -217,13 +208,13 @@ test "FutexTable single-word RMW fast-path mismatch, FIFO partial wake, and unpa
     };
 
     var st: State = .{};
-    var h1: Hook = .{ .st = &st, .id = 10, .waiter = .{ .ptr = &word, .expected = 0, .owner_ctx = null, .wake_fn = Hook.onWake } };
+    var h1: Hook = .{ .st = &st, .id = 10, .waiter = .{ .ptr = &word, .expected = 0, .wake_fn = Hook.onWake } };
     // Value is 1 != expected 0 -> does not park and restores low-32 waiter count to 0.
     try std.testing.expect(!table.tryPark(&h1.waiter));
 
     h1.waiter.expected = 1;
-    var h2: Hook = .{ .st = &st, .id = 20, .waiter = .{ .ptr = &word, .expected = 1, .owner_ctx = null, .wake_fn = Hook.onWake } };
-    var h3: Hook = .{ .st = &st, .id = 30, .waiter = .{ .ptr = &word, .expected = 1, .owner_ctx = null, .wake_fn = Hook.onWake } };
+    var h2: Hook = .{ .st = &st, .id = 20, .waiter = .{ .ptr = &word, .expected = 1, .wake_fn = Hook.onWake } };
+    var h3: Hook = .{ .st = &st, .id = 30, .waiter = .{ .ptr = &word, .expected = 1, .wake_fn = Hook.onWake } };
 
     try std.testing.expect(table.tryPark(&h1.waiter));
     try std.testing.expect(table.tryPark(&h2.waiter));
